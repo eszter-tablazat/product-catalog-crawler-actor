@@ -24,8 +24,10 @@ The full catalog is stored in an Apify Dataset, not in Dify workflow variables.
    - common price/title/meta selectors
    - specification tables, definition lists, and parameter blocks
    - sitemap discovery before crawling
+   - old PHP catalog pattern discovery, e.g. `product_details.php?id=1`
    - UNAS, ShopRenter, Magento, PrestaShop, OpenCart, Shopware HTML hints
    - catalog products without prices
+   - service offering pages as product-like records when `includeServices=true`
    - optional Firecrawl map for better URL discovery
 
 ## Run locally
@@ -54,6 +56,44 @@ the Actor ID or the `username~actor-name` form, for example
 
 For broader HTML discovery, set `FIRECRAWL_API_KEY` as an Apify Actor environment
 variable. The Dify workflow does not need to pass this secret in the visible input.
+
+## Send results to an internal database
+
+For production, keep Dify as the starter/status workflow and let the Actor send
+products directly to your internal HTTPS endpoint in batches. Set these Actor
+environment variables in Apify:
+
+```text
+OUTPUT_WEBHOOK_URL=https://your-system.example.com/products/import
+OUTPUT_WEBHOOK_API_KEY=your-secret-token
+OUTPUT_WEBHOOK_HEADER_NAME=Authorization
+OUTPUT_WEBHOOK_AUTH_PREFIX=Bearer
+OUTPUT_WEBHOOK_BATCH_SIZE=100
+```
+
+Each request is a JSON `POST`:
+
+```json
+{
+  "event": "products.batch",
+  "job": {
+    "runId": "apify-run-id",
+    "actorId": "apify-actor-id",
+    "sourceUrl": "https://example.com",
+    "companyId": "optional-internal-company-id",
+    "jobId": "optional-internal-job-id"
+  },
+  "batch": {
+    "index": 1,
+    "count": 100,
+    "totalSoFar": 100,
+    "isFinal": false
+  },
+  "products": []
+}
+```
+
+The last request uses `"event": "products.final_batch"` and `"isFinal": true`.
 
 ## Output
 

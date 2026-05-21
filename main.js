@@ -6,7 +6,9 @@ const DEFAULTS = {
   maxProducts: 5000,
   maxPages: 1000,
   includeVariants: true,
+  includeServices: true,
   useBrowserFallback: false,
+  generatedProductIdLimit: 300,
   webhookUrl: '',
   webhookApiKey: '',
   webhookHeaderName: 'Authorization',
@@ -35,6 +37,8 @@ const PRODUCT_URL_HINTS = [
   '/details/',
   '/adatlap/',
   '/product_info.php',
+  '/product_details.php',
+  '/product_detail.php',
   '/termekadatlap',
 ];
 
@@ -61,10 +65,44 @@ const CATEGORY_URL_HINTS = [
   'route=product/category',
 ];
 
+const SERVICE_URL_HINTS = [
+  '/klima-szereles',
+  '/klima-javitas',
+  '/klima-tisztitas',
+  '/hutokamra-telepites',
+  '/hoszivattyu-telepites',
+  '/hutoszerviz',
+  '/karbantartas',
+  '/telepites',
+  '/szereles',
+  '/javitas',
+  '/tisztitas',
+  '/garancia',
+  '/service/',
+  '/services/',
+  '/szolgaltatas/',
+  '/szolgáltatás/',
+];
+
 const BAD_URL_HINTS = [
   '/blog',
   '/hirek',
   '/news',
+  '/referencia',
+  '/referenciak',
+  '/referenciák',
+  '/referenci%C3%A1k',
+  '/allas',
+  '/karrier',
+  '/career',
+  '/rolunk',
+  '/rólunk',
+  '/r%C3%B3lunk',
+  '/about',
+  '/megoldasok',
+  '/megoldások',
+  '/megold%C3%A1sok',
+  '/solutions',
   '/contact',
   '/kapcsolat',
   '/cart',
@@ -116,9 +154,32 @@ const PRODUCT_TEXT_SIGNALS = [
   'brochure',
 ];
 
+const SERVICE_TEXT_SIGNALS = [
+  'szolgáltatás',
+  'szolgaltatas',
+  'telepítés',
+  'telepites',
+  'szerelés',
+  'szereles',
+  'javítás',
+  'javitas',
+  'tisztítás',
+  'tisztitas',
+  'karbantartás',
+  'karbantartas',
+  'beüzemelés',
+  'beuzemeles',
+  'garancia',
+  'kiszállási díj',
+  'kiszallasi dij',
+  'munkadíj',
+  'munkadij',
+  'helyszíni felmérés',
+  'helyszini felmeres',
+];
+
 const PRODUCT_CONTAINER_SELECTORS = [
   '[itemscope][itemtype*="Product"]',
-  '.product',
   '.product-detail',
   '.product_details',
   '.product-info',
@@ -134,7 +195,6 @@ const PRODUCT_CONTAINER_SELECTORS = [
   '#product_details',
   '[class*="product-detail"]',
   '[class*="product_detail"]',
-  '[class*="termek"]',
 ];
 
 const PROPERTY_BLOCK_SELECTORS = [
@@ -259,7 +319,7 @@ function normalizeUrl(value) {
   const url = new URL(String(value).trim());
   url.hash = '';
   for (const key of [...url.searchParams.keys()]) {
-    if (key.startsWith('utm_') || ['fbclid', 'gclid', 'yclid'].includes(key)) {
+    if (key.startsWith('utm_') || key === 'fcid' || ['fbclid', 'gclid', 'yclid'].includes(key)) {
       url.searchParams.delete(key);
     }
   }
@@ -288,10 +348,16 @@ function shouldSkipUrl(value) {
   return false;
 }
 
+function isServiceUrl(value) {
+  const lower = decodeURIComponent(String(value || '')).toLowerCase();
+  return SERVICE_URL_HINTS.some((hint) => lower.includes(hint));
+}
+
 function scoreUrl(value) {
   const lower = decodeURIComponent(String(value)).toLowerCase();
   let score = 0;
   if (PRODUCT_URL_HINTS.some((hint) => lower.includes(hint))) score += 100;
+  if (input.includeServices && isServiceUrl(value)) score += 80;
   if (CATEGORY_URL_HINTS.some((hint) => lower.includes(hint))) score += 50;
   if (/\/(?:[^/]+-)?(?:termek|product|modell|model|adatlap|catalog|katalogus)[^/]*$/i.test(lower)) score += 35;
   if (/\/[^/]*\d[^/]*(?:\/)?$/.test(lower)) score += 10;
@@ -344,7 +410,10 @@ async function fetchText(url, options = {}) {
 function parsePriceText(value) {
   const text = cleanText(value);
   if (!text) return null;
-  const match = text.match(/(?:\d[\d\s.,]*\s?(?:Ft|HUF|EUR|€|USD|\$)|(?:Ft|HUF|EUR|€|USD|\$)\s?\d[\d\s.,]*)/i);
+  if (/ár\s*kérésre|price\s*on\s*request|request\s*a\s*price/i.test(text)) return 'Ár kérésre';
+  const amount = String.raw`(?:\d{2,3}(?:[\s.,]\d{3})+(?:[.,]\d+)?|\d{2,}(?:[.,]\d+)?)`;
+  const currency = String.raw`(?:Ft|HUF|EUR|€|USD|\$)`;
+  const match = text.match(new RegExp(`(?:${amount}\\s*${currency}|${currency}\\s*${amount})`, 'i'));
   return match ? cleanText(match[0]) : null;
 }
 
@@ -593,6 +662,13 @@ function normalizeWooProduct(product, sourceType = 'product') {
 
 async function pushProduct(product) {
   if (!product?.name) return false;
+  if (product.url) {
+    try {
+      product.url = normalizeUrl(product.url);
+    } catch {
+      // Keep the original URL if normalization fails.
+    }
+  }
   const key = `${product.url || ''}|${product.sku || ''}|${product.name}|${product.properties?.variation || ''}`;
   if (seenProducts.has(key)) return false;
   if (productCount >= input.maxProducts) return false;
@@ -794,7 +870,7 @@ function detectPlatform($, url) {
   if (lowerUrl.includes('shop_artdet.php') || lowerUrl.includes('unas.hu') || lowerUrl.includes('unasshop') || html.includes('unas') || html.includes('shop_artdet.php')) return 'unas_html';
   if (html.includes('shoprenter') || html.includes('cdn.shoprenter.hu')) return 'shoprenter_html';
   if (generator.includes('woocommerce') || html.includes('woocommerce') || html.includes('wp-content/plugins/woocommerce')) return 'woocommerce_html';
-  if (generator.includes('magento') || html.includes('mage/') || html.includes('magento_') || lowerUrl.includes('/catalog/product/view')) return 'magento_html';
+  if (generator.includes('magento') || html.includes('/static/frontend/') || html.includes('magento_') || lowerUrl.includes('/catalog/product/view')) return 'magento_html';
   if (generator.includes('prestashop') || html.includes('prestashop') || lowerUrl.includes('controller=product')) return 'prestashop_html';
   if (generator.includes('opencart') || html.includes('index.php?route=product/product') || lowerUrl.includes('route=product/product')) return 'opencart_html';
   if (generator.includes('shopware') || html.includes('shopware')) return 'shopware_html';
@@ -883,6 +959,96 @@ function extractCategory($) {
   return breadcrumbs.length ? breadcrumbs.slice(-2).join(' > ') : null;
 }
 
+function siteBrand($) {
+  const brand = firstNonEmpty(
+    $('meta[property="og:site_name"]').attr('content'),
+    $('.logo img').first().attr('alt'),
+    $('.logo').first().text(),
+    $('[itemtype*="Organization"] [itemprop="name"]').first().text(),
+  );
+  return brand || hostKey(startUrl).split('.')[0];
+}
+
+function isGenericTitle(title, $) {
+  const clean = cleanText(title).toLowerCase();
+  const brand = siteBrand($).toLowerCase();
+  if (!clean) return true;
+  if (clean === brand) return true;
+  if (clean === hostKey(startUrl).toLowerCase()) return true;
+  if (clean.length < 3) return true;
+  return false;
+}
+
+function extractPageTitle($) {
+  const productScope = $('[itemscope][itemtype*="Product"]').first();
+  const productScopedTitle = productScope.length
+    ? firstNonEmpty(
+      productScope.find('[itemprop="name"]').first().attr('content'),
+      productScope.find('[itemprop="name"]').first().text(),
+      productScope.find('h1, h2, .product-title, .product-name').first().text(),
+    )
+    : '';
+
+  return firstNonEmpty(
+    productScopedTitle,
+    $('.product-title, .product-name, .product-detail-title, .p-name, [class*="product-title"], [class*="product-name"]').first().text(),
+    $('main h1').first().text(),
+    $('h1').first().text(),
+    $('meta[property="og:title"]').attr('content'),
+    $('title').text(),
+  );
+}
+
+function countSignals(pageText) {
+  return PRODUCT_TEXT_SIGNALS.reduce((count, signal) => count + (pageText.includes(signal) ? 1 : 0), 0);
+}
+
+function countServiceSignals(pageText) {
+  return SERVICE_TEXT_SIGNALS.reduce((count, signal) => count + (pageText.includes(signal) ? 1 : 0), 0);
+}
+
+function hasStrongProductMarker($) {
+  return Boolean(
+    $('[itemscope][itemtype*="Product"]').length
+    || $('[itemprop="sku"], [itemprop="mpn"], [itemprop="gtin"], [itemprop="price"]').length
+    || $('form[action*="cart"], form[action*="kosar"], button[name*="add"], button[class*="cart"], .add-to-cart, .kosarba').length
+    || $('[data-product-id], [data-sku]').length
+  );
+}
+
+function hasStrongServiceMarker($, url) {
+  if (!input.includeServices) return false;
+  if (!isServiceUrl(url)) return false;
+  const path = new URL(url).pathname.replace(/\/$/, '').toLowerCase();
+  if (['/szolgaltatasok', '/szolgáltatások', '/services', '/service'].includes(path)) return false;
+  const pageText = cleanText($('body').text()).toLowerCase();
+  return countServiceSignals(pageText) >= 2;
+}
+
+function productConfidence({ $, url, title, priceText, properties, sku, description }) {
+  let score = 0;
+  const urlScore = scoreUrl(url);
+  const pageText = cleanText($('body').text()).toLowerCase();
+
+  if (urlScore >= 100) score += 35;
+  else if (urlScore >= 50) score += 20;
+  else if (urlScore >= 10) score += 5;
+
+  if (hasStrongProductMarker($)) score += 35;
+  if (priceText) score += 20;
+  if (sku) score += 25;
+  if (Object.keys(properties || {}).length >= 2) score += 20;
+  if (Object.keys(properties || {}).length >= 5) score += 10;
+  if (description && description.length > 80) score += 10;
+  if (countSignals(pageText) >= 3) score += 10;
+  if (hasStrongServiceMarker($, url)) score += 35;
+  if (input.includeServices && isServiceUrl(url) && countServiceSignals(pageText) >= 3) score += 15;
+  if (!isGenericTitle(title, $)) score += 20;
+  else score -= 50;
+
+  return score;
+}
+
 function extractListingProducts($, url) {
   const products = [];
   const seenCards = new Set();
@@ -912,12 +1078,21 @@ function extractListingProducts($, url) {
       if (!text || text.length < 5) return;
 
       const linkEl = $card.find('a[href]').toArray()
-        .map((el) => ({
-          href: $(el).attr('href'),
-          text: cleanText($(el).attr('title') || $(el).text()),
-        }))
+        .map((el) => {
+          const href = $(el).attr('href');
+          try {
+            return {
+              href,
+              absUrl: href ? new URL(href, url).toString() : '',
+              text: cleanText($(el).attr('title') || $(el).text()),
+            };
+          } catch {
+            return null;
+          }
+        })
+        .filter(Boolean)
         .filter((item) => item.href && !/^(#|javascript:|mailto:|tel:)/i.test(item.href))
-        .sort((a, b) => scoreUrl(new URL(b.href, url).toString()) - scoreUrl(new URL(a.href, url).toString()))[0];
+        .sort((a, b) => scoreUrl(b.absUrl) - scoreUrl(a.absUrl))[0];
 
       const title = firstNonEmpty(
         $card.find('[itemprop="name"]').first().attr('content'),
@@ -926,8 +1101,13 @@ function extractListingProducts($, url) {
         linkEl?.text,
       );
       if (!title || title.length > 220) return;
+      if (isGenericTitle(title, $)) return;
 
-      const productUrl = linkEl?.href ? new URL(linkEl.href, url).toString() : url;
+      const productUrl = linkEl?.absUrl || url;
+      const cardUrlScore = scoreUrl(productUrl);
+      const cardHasProductMarker = $card.find('[itemprop="sku"], [itemprop="price"], [data-product-id], [data-sku], .price, .product-price, .add-to-cart, .kosarba').length > 0;
+      if (cardUrlScore < 50 && !cardHasProductMarker) return;
+
       const key = `${productUrl}|${title}`;
       if (seenCards.has(key)) return;
       seenCards.add(key);
@@ -940,7 +1120,6 @@ function extractListingProducts($, url) {
       const price = firstNonEmpty(
         $card.find('[itemprop="price"]').first().attr('content'),
         $card.find('.price, .ar, .termek-ar, .product-price, [class*="price"], [class*="Price"]').first().text(),
-        parsePriceText(text),
       );
 
       products.push({
@@ -951,7 +1130,7 @@ function extractListingProducts($, url) {
         name: title,
         url: productUrl,
         sku: null,
-        price: price || null,
+        price: parsePriceText(price),
         currency: null,
         category,
         description: truncate($card.find('.description, .summary, [class*="desc"]').first().text(), 1000),
@@ -967,26 +1146,17 @@ function extractListingProducts($, url) {
 }
 
 function extractDomProduct($, url) {
-  const title = firstNonEmpty(
-    $('[itemprop="name"]').first().attr('content'),
-    $('[itemprop="name"]').first().text(),
-    $('h1').first().text(),
-    $('meta[property="og:title"]').attr('content'),
-    $('title').text(),
-  );
+  const title = extractPageTitle($);
   const priceText = cleanText(
     $('[itemprop="price"]').first().attr('content')
     || $('[property="product:price:amount"]').first().attr('content')
     || $('.price, .ar, .termek-ar, .product-ar, .product-price, .woocommerce-Price-amount, [class*="price"], [class*="Price"]').first().text(),
   );
-  const pageText = cleanText($('body').text()).toLowerCase();
   const platform = detectPlatform($, url);
-  const urlScore = scoreUrl(url);
-  const hasProductSignals = PRODUCT_TEXT_SIGNALS.some((signal) => pageText.includes(signal));
-  const hasProductContainer = PRODUCT_CONTAINER_SELECTORS.some((selector) => $(selector).length > 0);
-  if (!title || (!priceText && !hasProductSignals && !hasProductContainer && urlScore < 50)) return null;
-
   const properties = extractProperties($);
+  if (hasStrongServiceMarker($, url)) {
+    properties.record_type = 'service';
+  }
   const sku = inferSku($, properties);
   const description = firstNonEmpty(
     $('meta[name="description"]').attr('content'),
@@ -994,6 +1164,8 @@ function extractDomProduct($, url) {
     $('[itemprop="description"]').first().text(),
     $('.summary, .description, .product-description, .short-description, .product-short-description, [class*="description"]').first().text(),
   );
+  const confidence = productConfidence({ $, url, title, priceText, properties, sku, description });
+  if (!title || confidence < 55) return null;
 
   return {
     source: platform,
@@ -1003,7 +1175,7 @@ function extractDomProduct($, url) {
     name: title,
     url,
     sku,
-    price: priceText || parsePriceText(pageText),
+    price: parsePriceText(priceText),
     currency: null,
     category: extractCategory($),
     description: truncate(description, 3000),
@@ -1093,10 +1265,52 @@ async function seedFromSitemaps(options) {
     .slice(0, options.maxPages);
 }
 
+function looksLikeProductDetailHtml(text) {
+  const lower = cleanText(text).toLowerCase();
+  const markers = [
+    'bruttó termék ár',
+    'brutto termek ar',
+    'műszaki adatok',
+    'muszaki adatok',
+    'megrendelés szerelés nélkül',
+    'megrendeles szereles nelkul',
+    'termék részletek',
+    'termek reszletek',
+    'product details',
+    'product_detail',
+    'product_details',
+  ];
+  return markers.some((marker) => lower.includes(marker));
+}
+
+async function seedFromGeneratedProductIds(options) {
+  const patterns = [
+    `${origin}/product_details.php?id={id}`,
+    `${origin}/product_detail.php?id={id}`,
+    `${origin}/product_info.php?id={id}`,
+  ];
+  const limit = Math.min(
+    Number.isFinite(Number(options.generatedProductIdLimit)) ? Number(options.generatedProductIdLimit) : 300,
+    Math.max(20, options.maxPages),
+    1000,
+  );
+
+  for (const pattern of patterns) {
+    const firstUrl = pattern.replace('{id}', '1');
+    const sample = await fetchText(firstUrl);
+    if (!sample || !looksLikeProductDetailHtml(sample)) continue;
+    log.info(`Sequential product detail pattern detected: ${pattern}`);
+    return Array.from({ length: limit }, (_item, index) => pattern.replace('{id}', String(index + 1)));
+  }
+
+  return [];
+}
+
 async function crawlHtmlFallback(options) {
   const firecrawlSeeds = await seedFromFirecrawlMap(options);
   const sitemapSeeds = await seedFromSitemaps(options);
-  const startUrls = [startUrl, ...sitemapSeeds, ...firecrawlSeeds]
+  const generatedProductSeeds = await seedFromGeneratedProductIds(options);
+  const startUrls = [startUrl, ...generatedProductSeeds, ...sitemapSeeds, ...firecrawlSeeds]
     .filter((url) => {
       try {
         return !shouldSkipUrl(url);
