@@ -4,7 +4,7 @@
   "type": "module",
   "description": "Job-based product catalog crawler for Dify. Writes results to Apify Dataset instead of Dify node outputs.",
   "scripts": {
-    "start": "node src/main.js"
+    "start": "node main.js"
   },
   "dependencies": {
     "apify": "^3.5.0",
