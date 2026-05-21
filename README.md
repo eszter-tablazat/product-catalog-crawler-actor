@@ -22,6 +22,7 @@ The full catalog is stored in an Apify Dataset, not in Dify workflow variables.
    - schema.org Product/ProductModel/ProductGroup
    - product listing cards from category/catalog pages
    - common price/title/meta selectors
+   - labelled prices such as `Bruttó termék ár`, `Megrendelés szerelés nélkül`, `Kiszállási díj`, and service fees
    - specification tables, definition lists, and parameter blocks
    - sitemap discovery before crawling
    - old PHP catalog pattern discovery, e.g. `product_details.php?id=1`

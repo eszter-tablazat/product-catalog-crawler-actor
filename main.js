@@ -178,6 +178,52 @@ const SERVICE_TEXT_SIGNALS = [
   'helyszini felmeres',
 ];
 
+const PRODUCT_PRICE_LABELS = [
+  'Bruttó termék ár',
+  'Brutto termek ar',
+  'Termék ár',
+  'Termek ar',
+  'Termék ára',
+  'Termek ara',
+  'Bruttó ár',
+  'Brutto ar',
+  'Nettó ár',
+  'Netto ar',
+  'Akciós ár',
+  'Akcios ar',
+  'Eladási ár',
+  'Eladasi ar',
+  'Fogyasztói ár',
+  'Fogyasztoi ar',
+  'Megrendelés szerelés nélkül',
+  'Megrendeles szereles nelkul',
+  'Ár szerelés nélkül',
+  'Ar szereles nelkul',
+];
+
+const SERVICE_PRICE_LABELS = [
+  'Kiszállási díj',
+  'Kiszallasi dij',
+  'Szervíz',
+  'Szerviz',
+  'Szerviz díj',
+  'Szerviz dij',
+  'Munkadíj',
+  'Munkadij',
+  'Óradíj',
+  'Oradij',
+  'Telepítési díj',
+  'Telepitesi dij',
+  'Telepítés díja',
+  'Telepites dija',
+  'Szerelési díj',
+  'Szerelesi dij',
+  'Tisztítás díja',
+  'Tisztitas dija',
+  'Karbantartási díj',
+  'Karbantartasi dij',
+];
+
 const PRODUCT_CONTAINER_SELECTORS = [
   '[itemscope][itemtype*="Product"]',
   '.product-detail',
@@ -373,6 +419,10 @@ function stripHtml(value) {
   return cleanText(String(value || '').replace(/<[^>]*>/g, ' '));
 }
 
+function foldText(value) {
+  return cleanText(value).toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+}
+
 function unique(values) {
   return [...new Set(values.filter(Boolean))];
 }
@@ -384,6 +434,14 @@ function firstNonEmpty(...values) {
 function truncate(value, max = 2000) {
   const text = cleanText(value);
   return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+}
+
+function cleanProductName(value) {
+  return stripHtml(value)
+    .replace(/^kl[íi]maszerel[ée]sek\s*\|\|\s*/i, '')
+    .replace(/\s*[-–|:]\s*term[ée]k\s+r[ée]szletek\s*$/i, '')
+    .replace(/\s*[-–|:]\s*product\s+details\s*$/i, '')
+    .trim();
 }
 
 function isLikelyXml(text) {
@@ -415,6 +473,80 @@ function parsePriceText(value) {
   const currency = String.raw`(?:Ft|HUF|EUR|€|USD|\$)`;
   const match = text.match(new RegExp(`(?:${amount}\\s*${currency}|${currency}\\s*${amount})`, 'i'));
   return match ? cleanText(match[0]) : null;
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function extractPriceNearLabels(text, labels) {
+  const clean = cleanText(text);
+  for (const label of labels) {
+    const labelPattern = escapeRegExp(label).replace(/\s+/g, '\\s+');
+    const regex = new RegExp(`${labelPattern}.{0,120}?((?:\\d{2,3}(?:[\\s.,]\\d{3})+(?:[.,]\\d+)?|\\d{2,}(?:[.,]\\d+)?)\\s*(?:Ft|HUF|EUR|€|USD|\\$)|(?:Ft|HUF|EUR|€|USD|\\$)\\s*(?:\\d{2,3}(?:[\\s.,]\\d{3})+(?:[.,]\\d+)?|\\d{2,}(?:[.,]\\d+)?))`, 'i');
+    const match = clean.match(regex);
+    if (match) return parsePriceText(match[1]);
+  }
+  return null;
+}
+
+function propertyKeyMatchesPriceLabel(key, labels) {
+  const foldedKey = foldText(key);
+  return labels.some((label) => {
+    const foldedLabel = foldText(label);
+    return foldedLabel.length > 2 && foldedKey.includes(foldedLabel);
+  });
+}
+
+function extractPriceFromProperties(properties, labels, allowAnyPrice = false) {
+  for (const [key, value] of Object.entries(properties || {})) {
+    if (propertyKeyMatchesPriceLabel(key, labels)) {
+      const parsed = parsePriceText(value) || parsePriceText(`${key} ${value}`);
+      if (parsed) return parsed;
+    }
+  }
+
+  if (!allowAnyPrice) return null;
+  for (const value of Object.values(properties || {})) {
+    const parsed = parsePriceText(value);
+    if (parsed) return parsed;
+  }
+  return null;
+}
+
+function extractStructuredPrice($) {
+  const amount = firstNonEmpty(
+    $('[itemprop="price"]').first().attr('content'),
+    $('[property="product:price:amount"]').first().attr('content'),
+    $('[name="twitter:data1"]').first().attr('content'),
+  );
+  const currency = firstNonEmpty(
+    $('[itemprop="priceCurrency"]').first().attr('content'),
+    $('[property="product:price:currency"]').first().attr('content'),
+  );
+  if (amount && currency) return parsePriceText(`${amount} ${currency}`);
+  return parsePriceText(amount);
+}
+
+function extractDomPrice($, properties, isServiceRecord) {
+  const direct = firstNonEmpty(
+    extractStructuredPrice($),
+    $('.price, .ar, .termek-ar, .product-ar, .product-price, .woocommerce-Price-amount, [class*="price"], [class*="Price"]').first().text(),
+  );
+  const directParsed = parsePriceText(direct);
+  if (directParsed) return directParsed;
+
+  const labels = isServiceRecord
+    ? [...SERVICE_PRICE_LABELS, ...PRODUCT_PRICE_LABELS]
+    : PRODUCT_PRICE_LABELS;
+  const fromBody = extractPriceNearLabels($('body').text(), labels);
+  if (fromBody) return fromBody;
+
+  const fromProperties = extractPriceFromProperties(properties, labels, isServiceRecord);
+  if (fromProperties) return fromProperties;
+
+  const productScopeText = $('[itemscope][itemtype*="Product"]').first().text();
+  return parsePriceText(productScopeText);
 }
 
 function priceFromWoo(prices) {
@@ -590,7 +722,7 @@ function xmlProductFromElement($xml, element, sourceUrl) {
     sourceType: 'product',
     id: sku || null,
     parentId: null,
-    name,
+    name: cleanProductName(name),
     url: link ? new URL(link, sourceUrl).toString() : sourceUrl,
     sku: sku || null,
     price: price || null,
@@ -644,7 +776,7 @@ function normalizeWooProduct(product, sourceType = 'product') {
     sourceType,
     id: product.id ?? null,
     parentId: product.parent || null,
-    name: cleanText(product.name),
+    name: cleanProductName(product.name),
     url: product.permalink || null,
     sku: product.sku || null,
     price: priceFromWoo(product.prices),
@@ -726,7 +858,7 @@ function normalizeShopifyProduct(product, baseUrl) {
     sourceType: 'product',
     id: product.id ?? null,
     parentId: null,
-    name: cleanText(product.title),
+    name: cleanProductName(product.title),
     url: `${baseUrl}/products/${product.handle}`,
     sku: firstVariant.sku || null,
     price: firstVariant.price || null,
@@ -833,13 +965,13 @@ function extractJsonLdProducts($, url) {
             sourceType: 'product',
             id: node.sku || node.mpn || null,
             parentId: null,
-            name: valueText(node.name),
+            name: cleanProductName(valueText(node.name)),
             url: node.url ? new URL(node.url, url).toString() : url,
             sku: node.sku || node.mpn || null,
             price: price ? `${price}${currency ? ` ${currency}` : ''}` : null,
             currency: currency || null,
             category: valueText(node.category) || null,
-            description: truncate(valueText(node.description), 3000),
+            description: truncate(stripHtml(valueText(node.description)), 3000),
             images: normalizeImages(node.image, url),
             properties,
             variants: [],
@@ -1100,15 +1232,16 @@ function extractListingProducts($, url) {
         $card.find('.product-title, .product-name, .card-title, .title, .name, h2, h3, h4').first().text(),
         linkEl?.text,
       );
-      if (!title || title.length > 220) return;
-      if (isGenericTitle(title, $)) return;
+      const cleanTitle = cleanProductName(title);
+      if (!cleanTitle || cleanTitle.length > 220) return;
+      if (isGenericTitle(cleanTitle, $)) return;
 
       const productUrl = linkEl?.absUrl || url;
       const cardUrlScore = scoreUrl(productUrl);
       const cardHasProductMarker = $card.find('[itemprop="sku"], [itemprop="price"], [data-product-id], [data-sku], .price, .product-price, .add-to-cart, .kosarba').length > 0;
       if (cardUrlScore < 50 && !cardHasProductMarker) return;
 
-      const key = `${productUrl}|${title}`;
+      const key = `${productUrl}|${cleanTitle}`;
       if (seenCards.has(key)) return;
       seenCards.add(key);
 
@@ -1117,23 +1250,24 @@ function extractListingProducts($, url) {
         $card.find('img').first().attr('data-src'),
         $card.find('img').first().attr('data-original'),
       );
-      const price = firstNonEmpty(
+      const priceText = firstNonEmpty(
         $card.find('[itemprop="price"]').first().attr('content'),
         $card.find('.price, .ar, .termek-ar, .product-price, [class*="price"], [class*="Price"]').first().text(),
       );
+      const price = parsePriceText(priceText) || extractPriceNearLabels(text, PRODUCT_PRICE_LABELS);
 
       products.push({
         source: `${platform}_listing`,
         sourceType: 'product',
         id: $card.attr('data-product-id') || null,
         parentId: null,
-        name: title,
+        name: cleanTitle,
         url: productUrl,
         sku: null,
-        price: parsePriceText(price),
+        price,
         currency: null,
         category,
-        description: truncate($card.find('.description, .summary, [class*="desc"]').first().text(), 1000),
+        description: truncate(stripHtml($card.find('.description, .summary, [class*="desc"]').first().text()), 1000),
         images: image ? normalizeImages(image, url) : [],
         properties: {},
         variants: [],
@@ -1146,17 +1280,14 @@ function extractListingProducts($, url) {
 }
 
 function extractDomProduct($, url) {
-  const title = extractPageTitle($);
-  const priceText = cleanText(
-    $('[itemprop="price"]').first().attr('content')
-    || $('[property="product:price:amount"]').first().attr('content')
-    || $('.price, .ar, .termek-ar, .product-ar, .product-price, .woocommerce-Price-amount, [class*="price"], [class*="Price"]').first().text(),
-  );
+  const title = cleanProductName(extractPageTitle($));
   const platform = detectPlatform($, url);
   const properties = extractProperties($);
-  if (hasStrongServiceMarker($, url)) {
+  const isServiceRecord = hasStrongServiceMarker($, url);
+  if (isServiceRecord) {
     properties.record_type = 'service';
   }
+  const priceText = extractDomPrice($, properties, isServiceRecord);
   const sku = inferSku($, properties);
   const description = firstNonEmpty(
     $('meta[name="description"]').attr('content'),
@@ -1164,7 +1295,8 @@ function extractDomProduct($, url) {
     $('[itemprop="description"]').first().text(),
     $('.summary, .description, .product-description, .short-description, .product-short-description, [class*="description"]').first().text(),
   );
-  const confidence = productConfidence({ $, url, title, priceText, properties, sku, description });
+  const cleanDescription = stripHtml(description);
+  const confidence = productConfidence({ $, url, title, priceText, properties, sku, description: cleanDescription });
   if (!title || confidence < 55) return null;
 
   return {
@@ -1175,10 +1307,10 @@ function extractDomProduct($, url) {
     name: title,
     url,
     sku,
-    price: parsePriceText(priceText),
+    price: priceText,
     currency: null,
     category: extractCategory($),
-    description: truncate(description, 3000),
+    description: truncate(cleanDescription, 3000),
     images: extractProductImages($, url),
     properties,
     variants: [],
