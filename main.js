@@ -7,6 +7,14 @@ const DEFAULTS = {
   maxPages: 1000,
   includeVariants: true,
   useBrowserFallback: false,
+  webhookUrl: '',
+  webhookApiKey: '',
+  webhookHeaderName: 'Authorization',
+  webhookAuthPrefix: 'Bearer',
+  webhookBatchSize: 100,
+  webhookFailOnError: false,
+  companyId: '',
+  jobId: '',
 };
 
 const PRODUCT_URL_HINTS = [
@@ -180,6 +188,13 @@ if (!input.firecrawlApiKey && process.env.FIRECRAWL_API_KEY) {
   input.firecrawlApiKey = process.env.FIRECRAWL_API_KEY;
 }
 
+input.webhookUrl = input.webhookUrl || process.env.OUTPUT_WEBHOOK_URL || '';
+input.webhookApiKey = input.webhookApiKey || process.env.OUTPUT_WEBHOOK_API_KEY || process.env.WEBHOOK_API_KEY || '';
+input.webhookHeaderName = input.webhookHeaderName || process.env.OUTPUT_WEBHOOK_HEADER_NAME || 'Authorization';
+input.webhookAuthPrefix = input.webhookAuthPrefix ?? process.env.OUTPUT_WEBHOOK_AUTH_PREFIX ?? 'Bearer';
+input.webhookBatchSize = Number(input.webhookBatchSize || process.env.OUTPUT_WEBHOOK_BATCH_SIZE || 100);
+input.webhookFailOnError = asBool(input.webhookFailOnError || process.env.OUTPUT_WEBHOOK_FAIL_ON_ERROR);
+
 if (!input.startUrl) {
   throw new Error('Missing required input.startUrl');
 }
@@ -190,12 +205,24 @@ const targetHost = hostKey(startUrl);
 const seenProducts = new Set();
 let productCount = 0;
 let pageCount = 0;
+let webhookBatchIndex = 0;
+let webhookDeliveredProducts = 0;
+let webhookFailedBatches = 0;
+const webhookBuffer = [];
 const summary = {
   startUrl,
   strategy: null,
   productCount: 0,
   pageCount: 0,
   datasetId: process.env.APIFY_DEFAULT_DATASET_ID || null,
+  actorRunId: process.env.APIFY_ACTOR_RUN_ID || null,
+  companyId: input.companyId || null,
+  jobId: input.jobId || null,
+  webhook: {
+    enabled: Boolean(input.webhookUrl),
+    deliveredProducts: 0,
+    failedBatches: 0,
+  },
   warnings: [],
 };
 
@@ -203,31 +230,26 @@ try {
   const feed = await tryXmlProductFeed(startUrl, input);
   if (feed.handled) {
     summary.strategy = 'xml_product_feed';
-    summary.productCount = productCount;
-    await Actor.setValue('SUMMARY', summary);
-    await Actor.exit();
+  } else {
+    const woo = await tryWooCommerce(origin, input);
+    if (woo.handled) {
+      summary.strategy = 'woocommerce_store_api';
+    } else {
+      const shopify = await tryShopify(origin, input);
+      if (shopify.handled) {
+        summary.strategy = 'shopify_products_json';
+      } else {
+        summary.strategy = 'html_crawl';
+        await crawlHtmlFallback(input);
+      }
+    }
   }
 
-  const woo = await tryWooCommerce(origin, input);
-  if (woo.handled) {
-    summary.strategy = 'woocommerce_store_api';
-    summary.productCount = productCount;
-    await Actor.setValue('SUMMARY', summary);
-    await Actor.exit();
-  }
-
-  const shopify = await tryShopify(origin, input);
-  if (shopify.handled) {
-    summary.strategy = 'shopify_products_json';
-    summary.productCount = productCount;
-    await Actor.setValue('SUMMARY', summary);
-    await Actor.exit();
-  }
-
-  summary.strategy = 'html_crawl';
-  await crawlHtmlFallback(input);
   summary.productCount = productCount;
   summary.pageCount = pageCount;
+  await flushWebhookBatch(true);
+  summary.webhook.deliveredProducts = webhookDeliveredProducts;
+  summary.webhook.failedBatches = webhookFailedBatches;
   await Actor.setValue('SUMMARY', summary);
 } finally {
   await Actor.exit();
@@ -351,6 +373,96 @@ async function fetchJson(url) {
   } catch {
     return null;
   }
+}
+
+function asBool(value) {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number') return value !== 0;
+  return ['true', '1', 'yes', 'y'].includes(String(value || '').trim().toLowerCase());
+}
+
+function webhookHeaders() {
+  const headers = {
+    'content-type': 'application/json',
+    'user-agent': 'ProductCatalogCrawler/1.1 (+https://apify.com)',
+  };
+  if (input.webhookApiKey) {
+    const headerName = input.webhookHeaderName || 'Authorization';
+    const prefix = input.webhookAuthPrefix === null || input.webhookAuthPrefix === undefined
+      ? 'Bearer'
+      : String(input.webhookAuthPrefix).trim();
+    headers[headerName] = headerName.toLowerCase() === 'authorization' && prefix
+      ? `${prefix} ${input.webhookApiKey}`
+      : input.webhookApiKey;
+  }
+  return headers;
+}
+
+function webhookPayload(products, isFinal = false) {
+  return {
+    event: isFinal ? 'products.final_batch' : 'products.batch',
+    job: {
+      runId: process.env.APIFY_ACTOR_RUN_ID || null,
+      actorId: process.env.APIFY_ACTOR_ID || null,
+      sourceUrl: startUrl,
+      companyId: input.companyId || null,
+      jobId: input.jobId || null,
+    },
+    batch: {
+      index: webhookBatchIndex,
+      count: products.length,
+      totalSoFar: productCount,
+      isFinal,
+    },
+    products,
+  };
+}
+
+async function postWebhook(payload) {
+  if (!input.webhookUrl) return true;
+  const maxAttempts = 3;
+  let lastError = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      const response = await fetch(input.webhookUrl, {
+        method: 'POST',
+        headers: webhookHeaders(),
+        body: JSON.stringify(payload),
+      });
+      if (response.ok) return true;
+      const text = await response.text().catch(() => '');
+      lastError = new Error(`HTTP ${response.status}: ${text.slice(0, 500)}`);
+    } catch (error) {
+      lastError = error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, attempt * 1000));
+  }
+
+  webhookFailedBatches += 1;
+  const message = `Webhook batch ${payload.batch?.index} failed: ${lastError?.message || 'unknown error'}`;
+  summary.warnings.push(message);
+  if (input.webhookFailOnError) throw new Error(message);
+  return false;
+}
+
+async function enqueueWebhookProduct(product) {
+  if (!input.webhookUrl) return;
+  webhookBuffer.push(product);
+  const batchSize = Number.isFinite(input.webhookBatchSize) && input.webhookBatchSize > 0
+    ? Math.min(Math.floor(input.webhookBatchSize), 1000)
+    : 100;
+  if (webhookBuffer.length >= batchSize) {
+    await flushWebhookBatch(false);
+  }
+}
+
+async function flushWebhookBatch(isFinal = false) {
+  if (!input.webhookUrl) return;
+  if (!webhookBuffer.length && !isFinal) return;
+  const products = webhookBuffer.splice(0, webhookBuffer.length);
+  webhookBatchIndex += 1;
+  const sent = await postWebhook(webhookPayload(products, isFinal));
+  if (sent) webhookDeliveredProducts += products.length;
 }
 
 function readXmlText($xml, element, names) {
@@ -487,6 +599,7 @@ async function pushProduct(product) {
   seenProducts.add(key);
   productCount += 1;
   await Actor.pushData(product);
+  await enqueueWebhookProduct(product);
   if (productCount % 100 === 0) {
     Actor.setStatusMessage(`Stored ${productCount} products`);
   }
