@@ -23,6 +23,8 @@ The full catalog is stored in an Apify Dataset, not in Dify workflow variables.
    - product listing cards from category/catalog pages
    - common price/title/meta selectors
    - labelled prices such as `Bruttó termék ár`, `Megrendelés szerelés nélkül`, `Kiszállási díj`, and service fees
+   - VAT status column for prices: `price_vat_status` = `bruttó`, `nettó`, or `ismeretlen`
+   - WooCommerce VAT status fallback: reads API/page hints first, then uses `woocommerceDefaultVatStatus` (`bruttó` by default)
    - specification tables, definition lists, and parameter blocks
    - sitemap discovery before crawling
    - old PHP catalog pattern discovery, e.g. `product_details.php?id=1`
@@ -108,6 +110,7 @@ Each dataset item is one normalized product:
   "url": "https://example.com/product/example",
   "sku": "ABC-123",
   "price": "123000 HUF",
+  "price_vat_status": "bruttó",
   "currency": "HUF",
   "category": "Category",
   "description": "Short description",

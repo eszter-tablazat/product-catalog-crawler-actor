@@ -1,6 +1,6 @@
 {
   "name": "product-catalog-crawler-actor",
-  "version": "1.2.4",
+  "version": "1.2.7",
   "type": "module",
   "description": "Job-based product catalog crawler for Dify. Writes results to Apify Dataset instead of Dify node outputs.",
   "scripts": {

@@ -9,6 +9,7 @@ const DEFAULTS = {
   includeServices: true,
   useBrowserFallback: false,
   generatedProductIdLimit: 300,
+  woocommerceDefaultVatStatus: 'bruttó',
   webhookUrl: '',
   webhookApiKey: '',
   webhookHeaderName: 'Authorization',
@@ -300,6 +301,10 @@ input.webhookHeaderName = input.webhookHeaderName || process.env.OUTPUT_WEBHOOK_
 input.webhookAuthPrefix = input.webhookAuthPrefix ?? process.env.OUTPUT_WEBHOOK_AUTH_PREFIX ?? 'Bearer';
 input.webhookBatchSize = Number(input.webhookBatchSize || process.env.OUTPUT_WEBHOOK_BATCH_SIZE || 100);
 input.webhookFailOnError = asBool(input.webhookFailOnError || process.env.OUTPUT_WEBHOOK_FAIL_ON_ERROR);
+input.woocommerceDefaultVatStatus = normalizeVatStatus(
+  input.woocommerceDefaultVatStatus || process.env.WOOCOMMERCE_DEFAULT_VAT_STATUS || 'bruttó',
+  'bruttó',
+);
 
 if (!input.startUrl) {
   throw new Error('Missing required input.startUrl');
@@ -469,25 +474,70 @@ function parsePriceText(value) {
   const text = cleanText(value);
   if (!text) return null;
   if (/ár\s*kérésre|price\s*on\s*request|request\s*a\s*price/i.test(text)) return 'Ár kérésre';
-  const amount = String.raw`(?:\d{2,3}(?:[\s.,]\d{3})+(?:[.,]\d+)?|\d{2,}(?:[.,]\d+)?)`;
+  const amount = String.raw`(?:\d{1,3}(?:[\s.,]\d{3})+(?:[.,]\d+)?|\d{2,}(?:[.,]\d+)?)`;
   const currency = String.raw`(?:Ft|HUF|EUR|€|USD|\$)`;
   const match = text.match(new RegExp(`(?:${amount}\\s*${currency}|${currency}\\s*${amount})`, 'i'));
   return match ? cleanText(match[0]) : null;
+}
+
+function normalizeVatStatus(value, fallback = 'ismeretlen') {
+  const text = foldText(value);
+  if (['brutto', 'bruttó', 'gross'].includes(text)) return 'bruttó';
+  if (['netto', 'nettó', 'net'].includes(text)) return 'nettó';
+  if (['ismeretlen', 'unknown', ''].includes(text)) return fallback;
+  return fallback;
+}
+
+function inferPriceVatStatus(value) {
+  const text = foldText(value);
+  if (!text) return 'ismeretlen';
+  const amount = String.raw`\d{1,3}(?:[\s.,]\d{3})+(?:[.,]\d+)?|\d{2,}(?:[.,]\d+)?`;
+  const grossWithNetInParentheses = new RegExp(`(?:${amount})\\s*(?:ft|huf|eur|€)\\s*\\([^)]*(?:${amount})\\s*(?:ft|huf|eur|€)?\\s*\\+\\s*afa`, 'i');
+  if (grossWithNetInParentheses.test(text)) return 'bruttó';
+  if (/(brutto|gross|vat included|tax included|incl\.?\s*vat|afa[- ]?val|afa-?t\s+tartalmaz|afat tartalmaz|afa tartalommal|tartalmazza\s+az\s+afa-?t|tartalmazzak\s+az\s+afa-?t)/i.test(text)) {
+    return 'bruttó';
+  }
+  if (/(netto|net price|vat excluded|tax excluded|excl\.?\s*vat|afa nelkul|plusz afa|\+\s*afa|nem tartalmazza\s+az\s+afa-?t)/i.test(text)) {
+    return 'nettó';
+  }
+  return 'ismeretlen';
+}
+
+function knownVatStatus(value) {
+  const status = inferPriceVatStatus(value);
+  return status === 'ismeretlen' ? null : status;
+}
+
+function priceInfo(price, context = '') {
+  if (!price) return null;
+  return {
+    price,
+    price_vat_status: inferPriceVatStatus(context || price),
+  };
+}
+
+function extractPriceInfoFromText(text) {
+  const price = parsePriceText(text);
+  return priceInfo(price, text);
 }
 
 function escapeRegExp(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-function extractPriceNearLabels(text, labels) {
+function extractPriceInfoNearLabels(text, labels) {
   const clean = cleanText(text);
   for (const label of labels) {
     const labelPattern = escapeRegExp(label).replace(/\s+/g, '\\s+');
-    const regex = new RegExp(`${labelPattern}.{0,120}?((?:\\d{2,3}(?:[\\s.,]\\d{3})+(?:[.,]\\d+)?|\\d{2,}(?:[.,]\\d+)?)\\s*(?:Ft|HUF|EUR|€|USD|\\$)|(?:Ft|HUF|EUR|€|USD|\\$)\\s*(?:\\d{2,3}(?:[\\s.,]\\d{3})+(?:[.,]\\d+)?|\\d{2,}(?:[.,]\\d+)?))`, 'i');
+    const regex = new RegExp(`${labelPattern}.{0,120}?((?:\\d{1,3}(?:[\\s.,]\\d{3})+(?:[.,]\\d+)?|\\d{2,}(?:[.,]\\d+)?)\\s*(?:Ft|HUF|EUR|€|USD|\\$)|(?:Ft|HUF|EUR|€|USD|\\$)\\s*(?:\\d{1,3}(?:[\\s.,]\\d{3})+(?:[.,]\\d+)?|\\d{2,}(?:[.,]\\d+)?))`, 'i');
     const match = clean.match(regex);
-    if (match) return parsePriceText(match[1]);
+    if (match) return priceInfo(parsePriceText(match[1]), `${label} ${match[0]}`);
   }
   return null;
+}
+
+function extractPriceNearLabels(text, labels) {
+  return extractPriceInfoNearLabels(text, labels)?.price || null;
 }
 
 function propertyKeyMatchesPriceLabel(key, labels) {
@@ -498,18 +548,18 @@ function propertyKeyMatchesPriceLabel(key, labels) {
   });
 }
 
-function extractPriceFromProperties(properties, labels, allowAnyPrice = false) {
+function extractPriceInfoFromProperties(properties, labels, allowAnyPrice = false) {
   for (const [key, value] of Object.entries(properties || {})) {
     if (propertyKeyMatchesPriceLabel(key, labels)) {
       const parsed = parsePriceText(value) || parsePriceText(`${key} ${value}`);
-      if (parsed) return parsed;
+      if (parsed) return priceInfo(parsed, `${key} ${value}`);
     }
   }
 
   if (!allowAnyPrice) return null;
   for (const value of Object.values(properties || {})) {
     const parsed = parsePriceText(value);
-    if (parsed) return parsed;
+    if (parsed) return priceInfo(parsed, value);
   }
   return null;
 }
@@ -528,25 +578,28 @@ function extractStructuredPrice($) {
   return parsePriceText(amount);
 }
 
-function extractDomPrice($, properties, isServiceRecord) {
-  const direct = firstNonEmpty(
-    extractStructuredPrice($),
-    $('.price, .ar, .termek-ar, .product-ar, .product-price, .woocommerce-Price-amount, [class*="price"], [class*="Price"]').first().text(),
-  );
-  const directParsed = parsePriceText(direct);
-  if (directParsed) return directParsed;
-
+function extractDomPriceInfo($, properties, isServiceRecord) {
   const labels = isServiceRecord
     ? [...SERVICE_PRICE_LABELS, ...PRODUCT_PRICE_LABELS]
     : PRODUCT_PRICE_LABELS;
-  const fromBody = extractPriceNearLabels($('body').text(), labels);
+  const fromBody = extractPriceInfoNearLabels($('body').text(), labels);
   if (fromBody) return fromBody;
 
-  const fromProperties = extractPriceFromProperties(properties, labels, isServiceRecord);
+  const fromProperties = extractPriceInfoFromProperties(properties, labels, isServiceRecord);
   if (fromProperties) return fromProperties;
 
+  const directText = firstNonEmpty(
+    $('.price, .ar, .termek-ar, .product-ar, .product-price, .woocommerce-Price-amount, [class*="price"], [class*="Price"]').first().text(),
+    $('[itemprop="price"]').first().parent().text(),
+  );
+  const directInfo = extractPriceInfoFromText(directText);
+  if (directInfo) return directInfo;
+
+  const structured = extractStructuredPrice($);
+  if (structured) return priceInfo(structured);
+
   const productScopeText = $('[itemscope][itemtype*="Product"]').first().text();
-  return parsePriceText(productScopeText);
+  return extractPriceInfoFromText(productScopeText);
 }
 
 function priceFromWoo(prices) {
@@ -682,6 +735,14 @@ function readXmlAttr($xml, element, names, attr) {
   return '';
 }
 
+function readXmlFirstText($xml, element, names) {
+  for (const name of names) {
+    const value = readXmlText($xml, element, [name]);
+    if (value) return { name, value };
+  }
+  return null;
+}
+
 function xmlProductFromElement($xml, element, sourceUrl) {
   const name = firstNonEmpty(
     readXmlText($xml, element, ['title', 'name', 'g\\:title', 'product_name', 'productname', 'megnevezes']),
@@ -698,9 +759,8 @@ function xmlProductFromElement($xml, element, sourceUrl) {
     readXmlText($xml, element, ['g\\:image_link', 'image_link', 'image', 'image_url', 'picture', 'picture_url', 'img']),
     readXmlAttr($xml, element, ['media\\:content', 'enclosure'], 'url'),
   );
-  const price = firstNonEmpty(
-    readXmlText($xml, element, ['g\\:price', 'price', 'ar', 'net_price', 'gross_price', 'sale_price']),
-  );
+  const priceMatch = readXmlFirstText($xml, element, ['gross_price', 'brutto_price', 'brutto_ar', 'net_price', 'netto_price', 'netto_ar', 'g\\:price', 'price', 'ar', 'sale_price']);
+  const price = priceMatch?.value || '';
   const sku = firstNonEmpty(
     readXmlText($xml, element, ['g\\:id', 'id', 'sku', 'cikkszam', 'item_group_id', 'product_id']),
   );
@@ -726,6 +786,7 @@ function xmlProductFromElement($xml, element, sourceUrl) {
     url: link ? new URL(link, sourceUrl).toString() : sourceUrl,
     sku: sku || null,
     price: price || null,
+    price_vat_status: priceMatch ? inferPriceVatStatus(`${priceMatch.name} ${priceMatch.value}`) : 'ismeretlen',
     currency: null,
     category: category || null,
     description: truncate(readXmlText($xml, element, ['description', 'g\\:description', 'short_description', 'desc']), 3000),
@@ -755,7 +816,44 @@ async function tryXmlProductFeed(url, options) {
   return { handled: productCount > 0 };
 }
 
-function normalizeWooProduct(product, sourceType = 'product') {
+function inferWooProductVatStatusFromApi(product) {
+  const contexts = [
+    product.price_html,
+    product.prices?.price_html,
+    product.short_description,
+    product.description,
+    product.add_to_cart?.description,
+    product.summary,
+    product.name,
+  ];
+  for (const context of contexts) {
+    const status = knownVatStatus(stripHtml(context));
+    if (status) return status;
+  }
+  return null;
+}
+
+async function detectWooCommerceVatStatus(baseUrl, sampleProduct, options) {
+  const fromApi = inferWooProductVatStatusFromApi(sampleProduct);
+  if (fromApi) return fromApi;
+
+  const sampleUrls = unique([sampleProduct?.permalink, baseUrl]);
+  for (const url of sampleUrls) {
+    const html = await fetchText(url);
+    if (!html) continue;
+    const $ = cheerio.load(html);
+    const focusedText = firstNonEmpty(
+      $('.woocommerce-price-suffix, .price, .summary, .product, [class*="tax"], [class*="vat"], [class*="afa"]').text(),
+      $('body').text(),
+    );
+    const status = knownVatStatus(focusedText);
+    if (status) return status;
+  }
+
+  return options.woocommerceDefaultVatStatus || 'bruttó';
+}
+
+function normalizeWooProduct(product, sourceType = 'product', priceVatStatus = 'ismeretlen') {
   const properties = {};
   if (product.sku) properties.sku = String(product.sku);
   if (product.weight) properties.weight = String(product.weight);
@@ -780,6 +878,7 @@ function normalizeWooProduct(product, sourceType = 'product') {
     url: product.permalink || null,
     sku: product.sku || null,
     price: priceFromWoo(product.prices),
+    price_vat_status: inferWooProductVatStatusFromApi(product) || priceVatStatus || 'ismeretlen',
     currency: product.prices?.currency_code || null,
     category: (product.categories || []).map((cat) => cat.name).filter(Boolean).join(', ') || null,
     description: stripHtml(product.short_description || product.description || ''),
@@ -794,6 +893,9 @@ function normalizeWooProduct(product, sourceType = 'product') {
 
 async function pushProduct(product) {
   if (!product?.name) return false;
+  if (!product.price_vat_status) {
+    product.price_vat_status = product.price ? inferPriceVatStatus(`${product.price} ${product.description || ''}`) : 'ismeretlen';
+  }
   if (product.url) {
     try {
       product.url = normalizeUrl(product.url);
@@ -820,12 +922,13 @@ async function tryWooCommerce(baseUrl, options) {
   if (!Array.isArray(first)) return { handled: false };
 
   log.info('WooCommerce Store API detected');
+  const wooPriceVatStatus = await detectWooCommerceVatStatus(baseUrl, first[0], options);
   for (let page = 1; productCount < options.maxProducts; page += 1) {
     const url = `${baseUrl}/wp-json/wc/store/v1/products?per_page=100&page=${page}`;
     const products = await fetchJson(url);
     if (!Array.isArray(products) || products.length === 0) break;
     for (const product of products) {
-      await pushProduct(normalizeWooProduct(product, 'product'));
+      await pushProduct(normalizeWooProduct(product, 'product', wooPriceVatStatus));
       if (productCount >= options.maxProducts) break;
     }
   }
@@ -836,7 +939,7 @@ async function tryWooCommerce(baseUrl, options) {
       const variations = await fetchJson(url);
       if (!Array.isArray(variations) || variations.length === 0) break;
       for (const variation of variations) {
-        await pushProduct(normalizeWooProduct(variation, 'variation'));
+        await pushProduct(normalizeWooProduct(variation, 'variation', wooPriceVatStatus));
         if (productCount >= options.maxProducts) break;
       }
     }
@@ -862,6 +965,7 @@ function normalizeShopifyProduct(product, baseUrl) {
     url: `${baseUrl}/products/${product.handle}`,
     sku: firstVariant.sku || null,
     price: firstVariant.price || null,
+    price_vat_status: 'ismeretlen',
     currency: null,
     category: product.product_type || null,
     description: stripHtml(product.body_html || ''),
@@ -960,6 +1064,10 @@ function extractJsonLdProducts($, url) {
             aggregateOffer.lowPrice && aggregateOffer.highPrice ? `${aggregateOffer.lowPrice} - ${aggregateOffer.highPrice}` : '',
           );
           const currency = valueText(offer.priceCurrency || aggregateOffer.priceCurrency);
+          const priceSpecification = asArray(offer.priceSpecification)[0] || asArray(aggregateOffer.priceSpecification)[0] || {};
+          let priceVatStatus = inferPriceVatStatus(valueText(priceSpecification.name || priceSpecification.description));
+          if (priceSpecification.valueAddedTaxIncluded === true) priceVatStatus = 'bruttó';
+          if (priceSpecification.valueAddedTaxIncluded === false) priceVatStatus = 'nettó';
           products.push({
             source: 'json_ld',
             sourceType: 'product',
@@ -969,6 +1077,7 @@ function extractJsonLdProducts($, url) {
             url: node.url ? new URL(node.url, url).toString() : url,
             sku: node.sku || node.mpn || null,
             price: price ? `${price}${currency ? ` ${currency}` : ''}` : null,
+            price_vat_status: priceVatStatus,
             currency: currency || null,
             category: valueText(node.category) || null,
             description: truncate(stripHtml(valueText(node.description)), 3000),
@@ -1254,7 +1363,7 @@ function extractListingProducts($, url) {
         $card.find('[itemprop="price"]').first().attr('content'),
         $card.find('.price, .ar, .termek-ar, .product-price, [class*="price"], [class*="Price"]').first().text(),
       );
-      const price = parsePriceText(priceText) || extractPriceNearLabels(text, PRODUCT_PRICE_LABELS);
+      const cardPriceInfo = extractPriceInfoFromText(priceText) || extractPriceInfoNearLabels(text, PRODUCT_PRICE_LABELS);
 
       products.push({
         source: `${platform}_listing`,
@@ -1264,7 +1373,8 @@ function extractListingProducts($, url) {
         name: cleanTitle,
         url: productUrl,
         sku: null,
-        price,
+        price: cardPriceInfo?.price || null,
+        price_vat_status: cardPriceInfo?.price_vat_status || 'ismeretlen',
         currency: null,
         category,
         description: truncate(stripHtml($card.find('.description, .summary, [class*="desc"]').first().text()), 1000),
@@ -1287,7 +1397,8 @@ function extractDomProduct($, url) {
   if (isServiceRecord) {
     properties.record_type = 'service';
   }
-  const priceText = extractDomPrice($, properties, isServiceRecord);
+  const priceInfoResult = extractDomPriceInfo($, properties, isServiceRecord);
+  const priceText = priceInfoResult?.price || null;
   const sku = inferSku($, properties);
   const description = firstNonEmpty(
     $('meta[name="description"]').attr('content'),
@@ -1308,6 +1419,7 @@ function extractDomProduct($, url) {
     url,
     sku,
     price: priceText,
+    price_vat_status: priceInfoResult?.price_vat_status || 'ismeretlen',
     currency: null,
     category: extractCategory($),
     description: truncate(cleanDescription, 3000),
