@@ -1565,10 +1565,12 @@ async function crawlHtmlFallback(options) {
     .sort((a, b) => scoreUrl(b) - scoreUrl(a))
     .slice(0, Math.min(options.maxPages, 5000));
 
-  const crawler = new CheerioCrawler({
-    maxRequestsPerCrawl: options.maxPages,
-    maxConcurrency: 10,
-    requestHandlerTimeoutSecs: 60,
+ const crawler = new CheerioCrawler({
+  maxRequestsPerCrawl: options.maxPages,
+  maxConcurrency: 2,
+  maxRequestsPerMinute: 20,
+  maxRequestRetries: 5,
+  requestHandlerTimeoutSecs: 60,
     async requestHandler({ $, request, enqueueLinks }) {
       pageCount += 1;
       const url = request.loadedUrl || request.url;
