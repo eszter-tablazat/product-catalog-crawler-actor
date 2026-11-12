@@ -42,6 +42,16 @@ ten-second delay between requests to the same domain. These values can be
 changed with `maxConcurrency`, `maxRequestsPerMinute`,
 `sameDomainDelaySecs`, and `maxRequestRetries` in the Actor input.
 
+HTML crawling uses Apify Proxy by default (`proxyMode=auto`). If a website still
+returns HTTP 429 because it blocks datacenter IP addresses, use
+`proxyMode=residential` and `proxyCountry=HU`. Residential proxy traffic is a
+paid Apify service. Set `proxyMode=none` only for sites that do not block the
+Actor's direct IP address.
+
+The direct platform/feed discovery stops after the first HTTP 429 and hands the
+job to the proxy-enabled HTML crawler instead of spending the run timeout on
+repeated direct requests.
+
 ## Run locally
 
 ```bash

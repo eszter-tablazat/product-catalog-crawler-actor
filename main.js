@@ -29,6 +29,8 @@ const DEFAULTS = {
   maxRequestsPerMinute: 6,
   sameDomainDelaySecs: 10,
   maxRequestRetries: 8,
+  proxyMode: 'auto',
+  proxyCountry: 'HU',
   includeVariants: true,
   includeServices: true,
   useBrowserFallback: false,
@@ -288,6 +290,9 @@ input.maxConcurrency = boundedInteger(input.maxConcurrency, 1, 1, 20);
 input.maxRequestsPerMinute = boundedInteger(input.maxRequestsPerMinute, 6, 1, 600);
 input.sameDomainDelaySecs = boundedInteger(input.sameDomainDelaySecs, 10, 0, 120);
 input.maxRequestRetries = boundedInteger(input.maxRequestRetries, 8, 0, 20);
+input.proxyMode = String(process.env.PROXY_MODE || input.proxyMode || 'auto').trim().toLowerCase();
+if (!['none', 'auto', 'residential'].includes(input.proxyMode)) input.proxyMode = 'auto';
+input.proxyCountry = String(process.env.PROXY_COUNTRY || input.proxyCountry || 'HU').trim().toUpperCase();
 
 if (!input.startUrl) {
   throw new Error('Missing required input.startUrl');
@@ -301,6 +306,7 @@ const canonicalByGroup = new Map();
 let productCount = 0;
 let pageCount = 0;
 let nextTargetFetchAt = 0;
+let targetDirectFetchBlocked = false;
 let webhookBatchIndex = 0;
 let webhookDeliveredProducts = 0;
 let webhookFailedBatches = 0;
@@ -319,6 +325,10 @@ const summary = {
     maxRequestsPerMinute: input.maxRequestsPerMinute,
     sameDomainDelaySecs: input.sameDomainDelaySecs,
     maxRequestRetries: input.maxRequestRetries,
+  },
+  proxy: {
+    mode: input.proxyMode,
+    country: input.proxyMode === 'residential' ? input.proxyCountry : null,
   },
   webhook: {
     enabled: Boolean(input.webhookUrl),
@@ -433,18 +443,16 @@ async function paceTargetRequest(url) {
 }
 
 async function fetchWithPacing(url, init) {
-  let response;
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    await paceTargetRequest(url);
-    response = await fetch(url, init);
-    if (response.status !== 429) return response;
+  const isTargetRequest = sameDomain(url);
+  if (isTargetRequest && targetDirectFetchBlocked) return null;
 
-    const retryAfter = Number(response.headers.get('retry-after'));
-    const backoffSecs = Number.isFinite(retryAfter) && retryAfter > 0
-      ? retryAfter
-      : Math.max(input.sameDomainDelaySecs, 5 * (2 ** attempt));
-    summary.warnings.push(`HTTP 429: ${url}; retrying after ${backoffSecs}s`);
-    await wait(backoffSecs * 1000);
+  await paceTargetRequest(url);
+  const response = await fetch(url, init);
+  if (response.status === 429 && isTargetRequest) {
+    targetDirectFetchBlocked = true;
+    const warning = `HTTP 429 during direct discovery: ${url}; switching to proxy crawler`;
+    summary.warnings.push(warning);
+    log.warning(warning);
   }
   return response;
 }
@@ -457,7 +465,7 @@ async function fetchText(url, options = {}) {
         'user-agent': 'ProductCatalogCrawler/1.0 (+https://apify.com)',
       },
     });
-    if (!response.ok) return null;
+    if (!response?.ok) return null;
     return response.text();
   } catch (error) {
     summary.warnings.push(`Fetch failed: ${url} - ${error.message}`);
@@ -522,7 +530,7 @@ async function fetchJson(url) {
         'user-agent': 'ProductCatalogCrawler/1.0 (+https://apify.com)',
       },
     });
-    if (!response.ok) return null;
+    if (!response?.ok) return null;
     const text = await response.text();
     return JSON.parse(text);
   } catch {
@@ -1469,10 +1477,36 @@ async function crawlHtmlFallback(options) {
   };
   log.info('Crawler throttle settings', throttleSettings);
 
+  let proxyConfiguration;
+  if (options.proxyMode !== 'none') {
+    const proxyOptions = options.proxyMode === 'residential'
+      ? { groups: ['RESIDENTIAL'], countryCode: options.proxyCountry }
+      : { useApifyProxy: true };
+    proxyConfiguration = await Actor.createProxyConfiguration(proxyOptions);
+    if (!proxyConfiguration) {
+      throw new Error(`Apify proxy is not available for proxyMode=${options.proxyMode}`);
+    }
+    log.info('Crawler proxy enabled', {
+      mode: options.proxyMode,
+      country: options.proxyMode === 'residential' ? options.proxyCountry : null,
+    });
+  } else {
+    log.warning('Crawler proxy disabled; IP-based blocking may cause HTTP 429 responses');
+  }
+
   const crawler = new CheerioCrawler({
     maxRequestsPerCrawl: options.maxPages,
     minConcurrency: 1,
     ...throttleSettings,
+    proxyConfiguration,
+    useSessionPool: true,
+    persistCookiesPerSession: true,
+    sessionPoolOptions: {
+      maxPoolSize: 20,
+      sessionOptions: {
+        maxUsageCount: 25,
+      },
+    },
     retryOnBlocked: true,
     requestHandlerTimeoutSecs: 60,
     async requestHandler({ $, request, enqueueLinks }) {
