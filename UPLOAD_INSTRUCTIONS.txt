@@ -1,0 +1,25 @@
+APIFY PRODUCT CRAWLER v1.2.11 - GITHUB FELTOLTES
+
+1. Bontsd ki az apify-product-crawler-v1.2.11-github-upload.zip fajlt.
+2. A kibontott mappa fajljait toltsd fel a GitHub repo GYOKEREBE.
+3. A GitHubon engedelyezd a meglevo fajlok felulirasat/cserejet.
+4. Commit uzenet: Release v1.2.11 - rate limit protection
+5. Apify Console -> Actor -> Builds -> Start build.
+6. A sikeres build kapja a latest cimket, majd indits tesztfutast.
+
+FONTOS:
+- A ZIP-et release assetkent is feltoltheted, de az Apify GitHub build nem a
+  release ZIP tartalmat olvassa. A kibontott main.js, package.json, Dockerfile,
+  extraction-utils.js es README.md fajloknak a repo gyokereben is ott kell lenniuk.
+- A package.json inditoparancsa: node main.js
+- Az uj logban ennek kell latszania:
+  product-catalog-crawler-actor@1.2.11
+  Crawler throttle settings
+- Nagyobb crawlhoz az Apify Actor futasi timeoutjat allitsd legalabb 3600 masodpercre.
+
+ALAPERTELMEZETT VEDELEM:
+- egyszerre 1 keres
+- maximum 6 keres percenkent
+- 10 masodperc varakozas ugyanazon domain keresei kozott
+- maximum 8 ujraprobalkozas
+- automatikus visszavaras HTTP 429 eseten a crawl elotti felderitesnel is

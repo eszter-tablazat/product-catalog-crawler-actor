@@ -1,15 +1,40 @@
 import { Actor } from 'apify';
 import { CheerioCrawler, log } from 'crawlee';
 import * as cheerio from 'cheerio';
+import {
+  PRODUCT_PRICE_LABELS,
+  SERVICE_PRICE_LABELS,
+  cleanProductName,
+  cleanText,
+  extractPriceInfoFromProperties,
+  extractPriceInfoFromText,
+  extractPriceInfoNearLabels,
+  firstNonEmpty,
+  inferPriceVatStatus,
+  inferWooProductVatStatusFromApi,
+  knownVatStatus,
+  normalizeVatStatus,
+  parsePriceText,
+  priceInfo,
+  resolveCanonical,
+  stripHtml,
+  truncate,
+  unique,
+} from './extraction-utils.js';
 
 const DEFAULTS = {
   maxProducts: 5000,
   maxPages: 1000,
+  maxConcurrency: 1,
+  maxRequestsPerMinute: 6,
+  sameDomainDelaySecs: 10,
+  maxRequestRetries: 8,
   includeVariants: true,
   includeServices: true,
   useBrowserFallback: false,
   generatedProductIdLimit: 300,
-  woocommerceDefaultVatStatus: 'bruttó',
+  defaultVatStatus: 'ismeretlen',
+  enableCanonicalGrouping: true,
   webhookUrl: '',
   webhookApiKey: '',
   webhookHeaderName: 'Authorization',
@@ -179,52 +204,6 @@ const SERVICE_TEXT_SIGNALS = [
   'helyszini felmeres',
 ];
 
-const PRODUCT_PRICE_LABELS = [
-  'Bruttó termék ár',
-  'Brutto termek ar',
-  'Termék ár',
-  'Termek ar',
-  'Termék ára',
-  'Termek ara',
-  'Bruttó ár',
-  'Brutto ar',
-  'Nettó ár',
-  'Netto ar',
-  'Akciós ár',
-  'Akcios ar',
-  'Eladási ár',
-  'Eladasi ar',
-  'Fogyasztói ár',
-  'Fogyasztoi ar',
-  'Megrendelés szerelés nélkül',
-  'Megrendeles szereles nelkul',
-  'Ár szerelés nélkül',
-  'Ar szereles nelkul',
-];
-
-const SERVICE_PRICE_LABELS = [
-  'Kiszállási díj',
-  'Kiszallasi dij',
-  'Szervíz',
-  'Szerviz',
-  'Szerviz díj',
-  'Szerviz dij',
-  'Munkadíj',
-  'Munkadij',
-  'Óradíj',
-  'Oradij',
-  'Telepítési díj',
-  'Telepitesi dij',
-  'Telepítés díja',
-  'Telepites dija',
-  'Szerelési díj',
-  'Szerelesi dij',
-  'Tisztítás díja',
-  'Tisztitas dija',
-  'Karbantartási díj',
-  'Karbantartasi dij',
-];
-
 const PRODUCT_CONTAINER_SELECTORS = [
   '[itemscope][itemtype*="Product"]',
   '.product-detail',
@@ -301,10 +280,14 @@ input.webhookHeaderName = input.webhookHeaderName || process.env.OUTPUT_WEBHOOK_
 input.webhookAuthPrefix = input.webhookAuthPrefix ?? process.env.OUTPUT_WEBHOOK_AUTH_PREFIX ?? 'Bearer';
 input.webhookBatchSize = Number(input.webhookBatchSize || process.env.OUTPUT_WEBHOOK_BATCH_SIZE || 100);
 input.webhookFailOnError = asBool(input.webhookFailOnError || process.env.OUTPUT_WEBHOOK_FAIL_ON_ERROR);
-input.woocommerceDefaultVatStatus = normalizeVatStatus(
-  input.woocommerceDefaultVatStatus || process.env.WOOCOMMERCE_DEFAULT_VAT_STATUS || 'bruttó',
-  'bruttó',
+input.defaultVatStatus = normalizeVatStatus(
+  input.defaultVatStatus || process.env.DEFAULT_VAT_STATUS || 'ismeretlen',
+  'ismeretlen',
 );
+input.maxConcurrency = boundedInteger(input.maxConcurrency, 1, 1, 20);
+input.maxRequestsPerMinute = boundedInteger(input.maxRequestsPerMinute, 6, 1, 600);
+input.sameDomainDelaySecs = boundedInteger(input.sameDomainDelaySecs, 10, 0, 120);
+input.maxRequestRetries = boundedInteger(input.maxRequestRetries, 8, 0, 20);
 
 if (!input.startUrl) {
   throw new Error('Missing required input.startUrl');
@@ -314,8 +297,10 @@ const startUrl = normalizeUrl(input.startUrl);
 const origin = new URL(startUrl).origin;
 const targetHost = hostKey(startUrl);
 const seenProducts = new Set();
+const canonicalByGroup = new Map();
 let productCount = 0;
 let pageCount = 0;
+let nextTargetFetchAt = 0;
 let webhookBatchIndex = 0;
 let webhookDeliveredProducts = 0;
 let webhookFailedBatches = 0;
@@ -329,6 +314,12 @@ const summary = {
   actorRunId: process.env.APIFY_ACTOR_RUN_ID || null,
   companyId: input.companyId || null,
   jobId: input.jobId || null,
+  crawlerThrottle: {
+    maxConcurrency: input.maxConcurrency,
+    maxRequestsPerMinute: input.maxRequestsPerMinute,
+    sameDomainDelaySecs: input.sameDomainDelaySecs,
+    maxRequestRetries: input.maxRequestRetries,
+  },
   webhook: {
     enabled: Boolean(input.webhookUrl),
     deliveredProducts: 0,
@@ -416,47 +407,51 @@ function scoreUrl(value) {
   return score;
 }
 
-function cleanText(value) {
-  return String(value || '').replace(/\s+/g, ' ').trim();
-}
-
-function stripHtml(value) {
-  return cleanText(String(value || '').replace(/<[^>]*>/g, ' '));
-}
-
-function foldText(value) {
-  return cleanText(value).toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
-}
-
-function unique(values) {
-  return [...new Set(values.filter(Boolean))];
-}
-
-function firstNonEmpty(...values) {
-  return values.map(cleanText).find(Boolean) || '';
-}
-
-function truncate(value, max = 2000) {
-  const text = cleanText(value);
-  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
-}
-
-function cleanProductName(value) {
-  return stripHtml(value)
-    .replace(/^kl[íi]maszerel[ée]sek\s*\|\|\s*/i, '')
-    .replace(/\s*[-–|:]\s*term[ée]k\s+r[ée]szletek\s*$/i, '')
-    .replace(/\s*[-–|:]\s*product\s+details\s*$/i, '')
-    .trim();
-}
-
 function isLikelyXml(text) {
   const head = String(text || '').slice(0, 500).trim().toLowerCase();
   return head.startsWith('<?xml') || head.startsWith('<rss') || head.startsWith('<feed') || head.startsWith('<urlset') || head.startsWith('<sitemapindex');
 }
 
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function paceTargetRequest(url) {
+  try {
+    if (hostKey(url) !== targetHost) return;
+  } catch {
+    return;
+  }
+
+  const delayMs = input.sameDomainDelaySecs * 1000;
+  if (delayMs <= 0) return;
+
+  const scheduledAt = Math.max(Date.now(), nextTargetFetchAt);
+  nextTargetFetchAt = scheduledAt + delayMs;
+  const waitMs = scheduledAt - Date.now();
+  if (waitMs > 0) await wait(waitMs);
+}
+
+async function fetchWithPacing(url, init) {
+  let response;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    await paceTargetRequest(url);
+    response = await fetch(url, init);
+    if (response.status !== 429) return response;
+
+    const retryAfter = Number(response.headers.get('retry-after'));
+    const backoffSecs = Number.isFinite(retryAfter) && retryAfter > 0
+      ? retryAfter
+      : Math.max(input.sameDomainDelaySecs, 5 * (2 ** attempt));
+    summary.warnings.push(`HTTP 429: ${url}; retrying after ${backoffSecs}s`);
+    await wait(backoffSecs * 1000);
+  }
+  return response;
+}
+
 async function fetchText(url, options = {}) {
   try {
-    const response = await fetch(url, {
+    const response = await fetchWithPacing(url, {
       headers: {
         accept: options.accept || 'text/html,application/xhtml+xml,application/xml,text/xml,*/*',
         'user-agent': 'ProductCatalogCrawler/1.0 (+https://apify.com)',
@@ -468,100 +463,6 @@ async function fetchText(url, options = {}) {
     summary.warnings.push(`Fetch failed: ${url} - ${error.message}`);
     return null;
   }
-}
-
-function parsePriceText(value) {
-  const text = cleanText(value);
-  if (!text) return null;
-  if (/ár\s*kérésre|price\s*on\s*request|request\s*a\s*price/i.test(text)) return 'Ár kérésre';
-  const amount = String.raw`(?:\d{1,3}(?:[\s.,]\d{3})+(?:[.,]\d+)?|\d{2,}(?:[.,]\d+)?)`;
-  const currency = String.raw`(?:Ft|HUF|EUR|€|USD|\$)`;
-  const match = text.match(new RegExp(`(?:${amount}\\s*${currency}|${currency}\\s*${amount})`, 'i'));
-  return match ? cleanText(match[0]) : null;
-}
-
-function normalizeVatStatus(value, fallback = 'ismeretlen') {
-  const text = foldText(value);
-  if (['brutto', 'bruttó', 'gross'].includes(text)) return 'bruttó';
-  if (['netto', 'nettó', 'net'].includes(text)) return 'nettó';
-  if (['ismeretlen', 'unknown', ''].includes(text)) return fallback;
-  return fallback;
-}
-
-function inferPriceVatStatus(value) {
-  const text = foldText(value);
-  if (!text) return 'ismeretlen';
-  const amount = String.raw`\d{1,3}(?:[\s.,]\d{3})+(?:[.,]\d+)?|\d{2,}(?:[.,]\d+)?`;
-  const grossWithNetInParentheses = new RegExp(`(?:${amount})\\s*(?:ft|huf|eur|€)\\s*\\([^)]*(?:${amount})\\s*(?:ft|huf|eur|€)?\\s*\\+\\s*afa`, 'i');
-  if (grossWithNetInParentheses.test(text)) return 'bruttó';
-  if (/(brutto|gross|vat included|tax included|incl\.?\s*vat|afa[- ]?val|afa-?t\s+tartalmaz|afat tartalmaz|afa tartalommal|tartalmazza\s+az\s+afa-?t|tartalmazzak\s+az\s+afa-?t)/i.test(text)) {
-    return 'bruttó';
-  }
-  if (/(netto|net price|vat excluded|tax excluded|excl\.?\s*vat|afa nelkul|plusz afa|\+\s*afa|nem tartalmazza\s+az\s+afa-?t)/i.test(text)) {
-    return 'nettó';
-  }
-  return 'ismeretlen';
-}
-
-function knownVatStatus(value) {
-  const status = inferPriceVatStatus(value);
-  return status === 'ismeretlen' ? null : status;
-}
-
-function priceInfo(price, context = '') {
-  if (!price) return null;
-  return {
-    price,
-    price_vat_status: inferPriceVatStatus(context || price),
-  };
-}
-
-function extractPriceInfoFromText(text) {
-  const price = parsePriceText(text);
-  return priceInfo(price, text);
-}
-
-function escapeRegExp(value) {
-  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-function extractPriceInfoNearLabels(text, labels) {
-  const clean = cleanText(text);
-  for (const label of labels) {
-    const labelPattern = escapeRegExp(label).replace(/\s+/g, '\\s+');
-    const regex = new RegExp(`${labelPattern}.{0,120}?((?:\\d{1,3}(?:[\\s.,]\\d{3})+(?:[.,]\\d+)?|\\d{2,}(?:[.,]\\d+)?)\\s*(?:Ft|HUF|EUR|€|USD|\\$)|(?:Ft|HUF|EUR|€|USD|\\$)\\s*(?:\\d{1,3}(?:[\\s.,]\\d{3})+(?:[.,]\\d+)?|\\d{2,}(?:[.,]\\d+)?))`, 'i');
-    const match = clean.match(regex);
-    if (match) return priceInfo(parsePriceText(match[1]), `${label} ${match[0]}`);
-  }
-  return null;
-}
-
-function extractPriceNearLabels(text, labels) {
-  return extractPriceInfoNearLabels(text, labels)?.price || null;
-}
-
-function propertyKeyMatchesPriceLabel(key, labels) {
-  const foldedKey = foldText(key);
-  return labels.some((label) => {
-    const foldedLabel = foldText(label);
-    return foldedLabel.length > 2 && foldedKey.includes(foldedLabel);
-  });
-}
-
-function extractPriceInfoFromProperties(properties, labels, allowAnyPrice = false) {
-  for (const [key, value] of Object.entries(properties || {})) {
-    if (propertyKeyMatchesPriceLabel(key, labels)) {
-      const parsed = parsePriceText(value) || parsePriceText(`${key} ${value}`);
-      if (parsed) return priceInfo(parsed, `${key} ${value}`);
-    }
-  }
-
-  if (!allowAnyPrice) return null;
-  for (const value of Object.values(properties || {})) {
-    const parsed = parsePriceText(value);
-    if (parsed) return priceInfo(parsed, value);
-  }
-  return null;
 }
 
 function extractStructuredPrice($) {
@@ -615,7 +516,7 @@ function priceFromWoo(prices) {
 
 async function fetchJson(url) {
   try {
-    const response = await fetch(url, {
+    const response = await fetchWithPacing(url, {
       headers: {
         accept: 'application/json,text/plain,*/*',
         'user-agent': 'ProductCatalogCrawler/1.0 (+https://apify.com)',
@@ -633,6 +534,12 @@ function asBool(value) {
   if (typeof value === 'boolean') return value;
   if (typeof value === 'number') return value !== 0;
   return ['true', '1', 'yes', 'y'].includes(String(value || '').trim().toLowerCase());
+}
+
+function boundedInteger(value, fallback, minimum, maximum) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return fallback;
+  return Math.min(Math.max(Math.floor(numeric), minimum), maximum);
 }
 
 function webhookHeaders() {
@@ -816,23 +723,6 @@ async function tryXmlProductFeed(url, options) {
   return { handled: productCount > 0 };
 }
 
-function inferWooProductVatStatusFromApi(product) {
-  const contexts = [
-    product.price_html,
-    product.prices?.price_html,
-    product.short_description,
-    product.description,
-    product.add_to_cart?.description,
-    product.summary,
-    product.name,
-  ];
-  for (const context of contexts) {
-    const status = knownVatStatus(stripHtml(context));
-    if (status) return status;
-  }
-  return null;
-}
-
 async function detectWooCommerceVatStatus(baseUrl, sampleProduct, options) {
   const fromApi = inferWooProductVatStatusFromApi(sampleProduct);
   if (fromApi) return fromApi;
@@ -850,7 +740,7 @@ async function detectWooCommerceVatStatus(baseUrl, sampleProduct, options) {
     if (status) return status;
   }
 
-  return options.woocommerceDefaultVatStatus || 'bruttó';
+  return options.defaultVatStatus || 'ismeretlen';
 }
 
 function normalizeWooProduct(product, sourceType = 'product', priceVatStatus = 'ismeretlen') {
@@ -908,6 +798,10 @@ async function pushProduct(product) {
   if (productCount >= input.maxProducts) return false;
   seenProducts.add(key);
   productCount += 1;
+  if (input.enableCanonicalGrouping !== false) {
+    const canonical = resolveCanonical(product, canonicalByGroup);
+    if (canonical) product.canonical = canonical;
+  }
   await Actor.pushData(product);
   await enqueueWebhookProduct(product);
   if (productCount % 100 === 0) {
@@ -1475,23 +1369,25 @@ async function parseSitemap(url, depth = 0) {
 }
 
 async function seedFromSitemaps(options) {
-  const candidates = [
+  const robotsText = await fetchText(`${origin}/robots.txt`, { accept: 'text/plain,*/*' });
+  const robotsSitemaps = String(robotsText || '')
+    .split(/\r?\n/)
+    .map((line) => line.match(/^\s*sitemap\s*:\s*(\S+)/i)?.[1])
+    .filter(Boolean);
+  const candidates = unique([
+    ...robotsSitemaps,
     `${origin}/sitemap.xml`,
     `${origin}/sitemap_index.xml`,
     `${origin}/product-sitemap.xml`,
-    `${origin}/product-sitemap1.xml`,
-    `${origin}/sitemap-products.xml`,
-    `${origin}/sitemap_product.xml`,
-    `${origin}/sitemap_products.xml`,
-    `${origin}/sitemap-termek.xml`,
-    `${origin}/sitemap_termek.xml`,
-  ];
+  ]).slice(0, 5);
 
   const urls = [];
   for (const url of candidates) {
     if (urls.length >= options.maxPages) break;
     try {
-      urls.push(...await parseSitemap(url));
+      const discovered = await parseSitemap(url);
+      urls.push(...discovered);
+      if (discovered.length > 0) break;
     } catch (error) {
       summary.warnings.push(`Sitemap failed: ${url} - ${error.message}`);
     }
@@ -1565,12 +1461,20 @@ async function crawlHtmlFallback(options) {
     .sort((a, b) => scoreUrl(b) - scoreUrl(a))
     .slice(0, Math.min(options.maxPages, 5000));
 
- const crawler = new CheerioCrawler({
-  maxRequestsPerCrawl: options.maxPages,
-  maxConcurrency: 2,
-  maxRequestsPerMinute: 20,
-  maxRequestRetries: 5,
-  requestHandlerTimeoutSecs: 60,
+  const throttleSettings = {
+    maxConcurrency: options.maxConcurrency,
+    maxRequestsPerMinute: options.maxRequestsPerMinute,
+    sameDomainDelaySecs: options.sameDomainDelaySecs,
+    maxRequestRetries: options.maxRequestRetries,
+  };
+  log.info('Crawler throttle settings', throttleSettings);
+
+  const crawler = new CheerioCrawler({
+    maxRequestsPerCrawl: options.maxPages,
+    minConcurrency: 1,
+    ...throttleSettings,
+    retryOnBlocked: true,
+    requestHandlerTimeoutSecs: 60,
     async requestHandler({ $, request, enqueueLinks }) {
       pageCount += 1;
       const url = request.loadedUrl || request.url;

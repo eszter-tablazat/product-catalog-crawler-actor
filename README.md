@@ -24,7 +24,8 @@ The full catalog is stored in an Apify Dataset, not in Dify workflow variables.
    - common price/title/meta selectors
    - labelled prices such as `Bruttó termék ár`, `Megrendelés szerelés nélkül`, `Kiszállási díj`, and service fees
    - VAT status column for prices: `price_vat_status` = `bruttó`, `nettó`, or `ismeretlen`
-   - WooCommerce VAT status fallback: reads API/page hints first, then uses `woocommerceDefaultVatStatus` (`bruttó` by default)
+   - VAT status is inferred only from API/page hints by default; unknown cases stay `ismeretlen`
+   - canonical product grouping: recognized product families get a `canonical` block; the first product seen in the group becomes canonical
    - specification tables, definition lists, and parameter blocks
    - sitemap discovery before crawling
    - old PHP catalog pattern discovery, e.g. `product_details.php?id=1`
@@ -32,6 +33,14 @@ The full catalog is stored in an Apify Dataset, not in Dify workflow variables.
    - catalog products without prices
    - service offering pages as product-like records when `includeServices=true`
    - optional Firecrawl map for better URL discovery
+
+## Rate limiting
+
+The Actor uses conservative defaults to avoid HTTP 429 responses on smaller
+catalog sites: one concurrent request, at most six requests per minute, and a
+ten-second delay between requests to the same domain. These values can be
+changed with `maxConcurrency`, `maxRequestsPerMinute`,
+`sameDomainDelaySecs`, and `maxRequestRetries` in the Actor input.
 
 ## Run locally
 
@@ -43,6 +52,18 @@ apify run -i '{
   "maxPages": 1000,
   "includeVariants": true
 }'
+```
+
+## Test
+
+```bash
+npm test
+```
+
+If `npm` is not available in a local shell, run the same tests with:
+
+```bash
+node --test
 ```
 
 ## Deploy
@@ -117,6 +138,12 @@ Each dataset item is one normalized product:
   "images": ["https://example.com/image.jpg"],
   "properties": {
     "weight": "3 kg"
+  },
+  "canonical": {
+    "groupKey": "MIDEA|Xtreme Save|split",
+    "isCanonical": false,
+    "canonicalUrl": "https://example.com/product/midea-mg2x-09-sp",
+    "canonicalName": "Midea MG2X-09-SP Xtreme Save oldalfali split (R32, 2,6 kW)"
   },
   "variants": []
 }
