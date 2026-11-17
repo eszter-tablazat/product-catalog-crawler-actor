@@ -113,6 +113,8 @@ const SERVICE_URL_HINTS = [
 ];
 
 const BAD_URL_HINTS = [
+  '/attachment/',
+  '/wp-content/uploads/',
   '/blog',
   '/hirek',
   '/news',
@@ -314,6 +316,7 @@ const webhookBuffer = [];
 const summary = {
   startUrl,
   strategy: null,
+  stoppedReason: null,
   productCount: 0,
   pageCount: 0,
   datasetId: process.env.APIFY_DEFAULT_DATASET_ID || null,
@@ -1477,6 +1480,11 @@ async function crawlHtmlFallback(options) {
   };
   log.info('Crawler throttle settings', throttleSettings);
 
+  // NOTE: sameDomainDelaySecs is NOT passed to Crawlee. Crawlee implements it by
+  // reclaiming the request to the queue, which on the Apify platform makes the
+  // request reappear only after ~60 s (=> 1 page/min). We pace in-process instead.
+  const { sameDomainDelaySecs: _ignoredDelay, ...crawleeThrottle } = throttleSettings;
+
   let proxyConfiguration;
   if (options.proxyMode !== 'none') {
     const proxyOptions = options.proxyMode === 'residential'
@@ -1497,7 +1505,7 @@ async function crawlHtmlFallback(options) {
   const crawler = new CheerioCrawler({
     maxRequestsPerCrawl: options.maxPages,
     minConcurrency: 1,
-    ...throttleSettings,
+    ...crawleeThrottle,
     proxyConfiguration,
     useSessionPool: true,
     persistCookiesPerSession: true,
@@ -1509,6 +1517,11 @@ async function crawlHtmlFallback(options) {
     },
     retryOnBlocked: true,
     requestHandlerTimeoutSecs: 60,
+    preNavigationHooks: [
+      async ({ request }) => {
+        await paceTargetRequest(request.url);
+      },
+    ],
     async requestHandler({ $, request, enqueueLinks }) {
       pageCount += 1;
       const url = request.loadedUrl || request.url;
@@ -1546,5 +1559,30 @@ async function crawlHtmlFallback(options) {
     },
   });
 
-  await crawler.run(startUrls);
+  const stopTimer = scheduleTimeBudgetStop(crawler);
+  try {
+    await crawler.run(startUrls);
+  } finally {
+    if (stopTimer) clearTimeout(stopTimer);
+  }
+}
+
+function scheduleTimeBudgetStop(crawler) {
+  const timeoutAt = Date.parse(process.env.ACTOR_TIMEOUT_AT || process.env.APIFY_TIMEOUT_AT || '');
+  if (!Number.isFinite(timeoutAt)) return null;
+  const reserveMs = 3 * 60 * 1000;
+  const stopInMs = timeoutAt - Date.now() - reserveMs;
+  const stop = () => {
+    summary.stoppedReason = 'time_budget';
+    const warning = `Time budget reached; stopping crawler ${Math.round(reserveMs / 1000)}s before Actor timeout`;
+    summary.warnings.push(warning);
+    log.warning(warning, { pageCount, productCount });
+    crawler.stop();
+  };
+  if (stopInMs <= 0) {
+    stop();
+    return null;
+  }
+  log.info('Crawler time budget', { stopAt: new Date(Date.now() + stopInMs).toISOString() });
+  return setTimeout(stop, stopInMs);
 }

@@ -158,3 +158,13 @@ Each dataset item is one normalized product:
   "variants": []
 }
 ```
+
+## v1.2.13
+
+- `sameDomainDelaySecs` is applied in-process (pre-navigation hook) instead of
+  Crawlee's queue-reclaim mechanism, which on the Apify platform throttled the
+  crawl to ~1 page/minute.
+- The crawler stops ~3 minutes before the Actor timeout (`ACTOR_TIMEOUT_AT`), so
+  `SUMMARY` and the final webhook batch are always written
+  (`summary.stoppedReason = "time_budget"`).
+- `/attachment/` and `/wp-content/uploads/` URLs are skipped.
