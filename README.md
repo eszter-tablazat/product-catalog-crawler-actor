@@ -179,4 +179,5 @@ Each dataset item is one normalized product:
 
 ## Build
 
-The Actor is built automatically by Apify on every push to `main`.
+The Actor is built automatically by Apify on every push to `main`
+(Source → Build settings → Automatic builds).
