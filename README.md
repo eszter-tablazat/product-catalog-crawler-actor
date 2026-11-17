@@ -176,3 +176,7 @@ Each dataset item is one normalized product:
   (`got-scraping` + `proxyConfiguration.newUrl()`), unless `proxyMode=none`.
 - The crawler stops as soon as `maxProducts` is reached
   (`summary.stoppedReason = "max_products"`).
+
+## Build
+
+The Actor is built automatically by Apify on every push to `main`.
