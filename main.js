@@ -1625,7 +1625,11 @@ function stopOnMaxProducts(crawler, options) {
 function scheduleTimeBudgetStop(crawler) {
   const timeoutAt = Date.parse(process.env.ACTOR_TIMEOUT_AT || process.env.APIFY_TIMEOUT_AT || '');
   if (!Number.isFinite(timeoutAt)) return null;
-  const reserveMs = 3 * 60 * 1000;
+  // Reserve time for SUMMARY + webhook flush: 10% of the total run time,
+  // at least 30 s and at most 180 s (a fixed 180 s ate most of a 300 s run).
+  const startedAt = Date.parse(process.env.ACTOR_STARTED_AT || process.env.APIFY_STARTED_AT || '') || Date.now();
+  const totalMs = Math.max(0, timeoutAt - startedAt);
+  const reserveMs = Math.min(180000, Math.max(30000, Math.round(totalMs * 0.1)));
   const stopInMs = timeoutAt - Date.now() - reserveMs;
   const stop = () => {
     if (summary.stoppedReason) return;
@@ -1639,6 +1643,6 @@ function scheduleTimeBudgetStop(crawler) {
     stop();
     return null;
   }
-  log.info('Crawler time budget', { stopAt: new Date(Date.now() + stopInMs).toISOString() });
+  log.info('Crawler time budget', { stopAt: new Date(Date.now() + stopInMs).toISOString(), reserveSecs: Math.round(reserveMs / 1000) });
   return setTimeout(stop, stopInMs);
 }

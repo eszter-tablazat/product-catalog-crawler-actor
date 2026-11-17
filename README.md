@@ -181,3 +181,8 @@ Each dataset item is one normalized product:
 
 The Actor is built automatically by Apify on every push to `main`
 (Source → Build settings → Automatic builds).
+
+## v1.2.15
+
+- Time-budget reserve is 10% of the Actor timeout (min 30 s, max 180 s)
+  instead of a fixed 180 s, so short runs (e.g. 300 s) keep most of their time.
