@@ -168,3 +168,11 @@ Each dataset item is one normalized product:
   `SUMMARY` and the final webhook batch are always written
   (`summary.stoppedReason = "time_budget"`).
 - `/attachment/` and `/wp-content/uploads/` URLs are skipped.
+
+## v1.2.14
+
+- Discovery requests to the target domain (feeds, sitemaps, robots.txt,
+  WooCommerce/Shopify APIs) use the same Apify Proxy as the HTML crawler
+  (`got-scraping` + `proxyConfiguration.newUrl()`), unless `proxyMode=none`.
+- The crawler stops as soon as `maxProducts` is reached
+  (`summary.stoppedReason = "max_products"`).

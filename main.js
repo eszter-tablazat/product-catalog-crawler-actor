@@ -1,3 +1,4 @@
+import { gotScraping } from 'got-scraping';
 import { Actor } from 'apify';
 import { CheerioCrawler, log } from 'crawlee';
 import * as cheerio from 'cheerio';
@@ -309,6 +310,8 @@ let productCount = 0;
 let pageCount = 0;
 let nextTargetFetchAt = 0;
 let targetDirectFetchBlocked = false;
+let sharedProxyConfiguration;
+let proxyConfigurationResolved = false;
 let webhookBatchIndex = 0;
 let webhookDeliveredProducts = 0;
 let webhookFailedBatches = 0;
@@ -450,7 +453,10 @@ async function fetchWithPacing(url, init) {
   if (isTargetRequest && targetDirectFetchBlocked) return null;
 
   await paceTargetRequest(url);
-  const response = await fetch(url, init);
+  const proxyConfiguration = isTargetRequest ? await getProxyConfiguration(input) : null;
+  const response = proxyConfiguration
+    ? await fetchViaProxy(url, init, proxyConfiguration)
+    : await fetch(url, init);
   if (response.status === 429 && isTargetRequest) {
     targetDirectFetchBlocked = true;
     const warning = `HTTP 429 during direct discovery: ${url}; switching to proxy crawler`;
@@ -458,6 +464,49 @@ async function fetchWithPacing(url, init) {
     log.warning(warning);
   }
   return response;
+}
+
+// Discovery requests (feeds, sitemaps, Woo/Shopify APIs) to the target domain go
+// through the same Apify Proxy as the HTML crawler. Direct datacenter requests were
+// rejected by some sites (e.g. nilan.hu: "fetch failed").
+async function fetchViaProxy(url, init = {}, proxyConfiguration) {
+  const proxyUrl = await proxyConfiguration.newUrl();
+  const res = await gotScraping({
+    url,
+    method: init.method || 'GET',
+    headers: init.headers,
+    body: init.body,
+    proxyUrl,
+    throwHttpErrors: false,
+    followRedirect: true,
+    timeout: { request: 30000 },
+    retry: { limit: 1 },
+  });
+  const body = typeof res.body === 'string' ? res.body : String(res.body ?? '');
+  return {
+    ok: res.statusCode >= 200 && res.statusCode < 300,
+    status: res.statusCode,
+    headers: res.headers,
+    text: async () => body,
+    json: async () => JSON.parse(body),
+  };
+}
+
+async function getProxyConfiguration(options) {
+  if (proxyConfigurationResolved) return sharedProxyConfiguration;
+  proxyConfigurationResolved = true;
+  if (options.proxyMode === 'none') {
+    sharedProxyConfiguration = undefined;
+    return sharedProxyConfiguration;
+  }
+  const proxyOptions = options.proxyMode === 'residential'
+    ? { groups: ['RESIDENTIAL'], countryCode: options.proxyCountry }
+    : { useApifyProxy: true };
+  sharedProxyConfiguration = await Actor.createProxyConfiguration(proxyOptions);
+  if (!sharedProxyConfiguration) {
+    throw new Error(`Apify proxy is not available for proxyMode=${options.proxyMode}`);
+  }
+  return sharedProxyConfiguration;
 }
 
 async function fetchText(url, options = {}) {
@@ -1485,15 +1534,8 @@ async function crawlHtmlFallback(options) {
   // request reappear only after ~60 s (=> 1 page/min). We pace in-process instead.
   const { sameDomainDelaySecs: _ignoredDelay, ...crawleeThrottle } = throttleSettings;
 
-  let proxyConfiguration;
-  if (options.proxyMode !== 'none') {
-    const proxyOptions = options.proxyMode === 'residential'
-      ? { groups: ['RESIDENTIAL'], countryCode: options.proxyCountry }
-      : { useApifyProxy: true };
-    proxyConfiguration = await Actor.createProxyConfiguration(proxyOptions);
-    if (!proxyConfiguration) {
-      throw new Error(`Apify proxy is not available for proxyMode=${options.proxyMode}`);
-    }
+  const proxyConfiguration = await getProxyConfiguration(options);
+  if (proxyConfiguration) {
     log.info('Crawler proxy enabled', {
       mode: options.proxyMode,
       country: options.proxyMode === 'residential' ? options.proxyCountry : null,
@@ -1531,12 +1573,18 @@ async function crawlHtmlFallback(options) {
       }
       for (const product of extractListingProducts($, url)) {
         await pushProduct(product);
-        if (productCount >= options.maxProducts) return;
+        if (productCount >= options.maxProducts) {
+          stopOnMaxProducts(crawler, options);
+          return;
+        }
       }
       const domProduct = extractDomProduct($, url);
       if (domProduct) await pushProduct(domProduct);
 
-      if (productCount >= options.maxProducts) return;
+      if (productCount >= options.maxProducts) {
+        stopOnMaxProducts(crawler, options);
+        return;
+      }
 
       await enqueueLinks({
         strategy: 'same-domain',
@@ -1567,12 +1615,20 @@ async function crawlHtmlFallback(options) {
   }
 }
 
+function stopOnMaxProducts(crawler, options) {
+  if (summary.stoppedReason) return;
+  summary.stoppedReason = 'max_products';
+  log.info('maxProducts reached; stopping crawler', { maxProducts: options.maxProducts, pageCount, productCount });
+  crawler.stop();
+}
+
 function scheduleTimeBudgetStop(crawler) {
   const timeoutAt = Date.parse(process.env.ACTOR_TIMEOUT_AT || process.env.APIFY_TIMEOUT_AT || '');
   if (!Number.isFinite(timeoutAt)) return null;
   const reserveMs = 3 * 60 * 1000;
   const stopInMs = timeoutAt - Date.now() - reserveMs;
   const stop = () => {
+    if (summary.stoppedReason) return;
     summary.stoppedReason = 'time_budget';
     const warning = `Time budget reached; stopping crawler ${Math.round(reserveMs / 1000)}s before Actor timeout`;
     summary.warnings.push(warning);
