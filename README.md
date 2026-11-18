@@ -182,6 +182,18 @@ Each dataset item is one normalized product:
 The Actor is built automatically by Apify on every push to `main`
 (Source → Build settings → Automatic builds).
 
+## v1.2.18
+
+- Category = full breadcrumb path (e.g. `Telepített gázérzékelők > Gázérzékelő fejek > MSA`),
+  without home/generic roots and the product's own name (was: last 2 links only).
+- JSON-LD products get the category from the breadcrumb when JSON-LD has none.
+- No breadcrumb: category rebuilt from the URL's parent paths, using the site's link text
+  (e.g. logisys.hu `/termekek/logipix-rendszer-elemei/...` → `Logipix rendszer elemei`).
+- JSON-LD products with empty description fall back to meta description / main content text.
+- A page with a JSON-LD product no longer also yields a DOM-heuristic record (removed
+  duplicates with wrongly picked titles).
+- JSON-LD price `0` is treated as missing (`null`), not "0 HUF".
+
 ## v1.2.17
 
 - Faster default pace: `maxRequestsPerMinute` 30 (was 6), `sameDomainDelaySecs` 2 (was 10).

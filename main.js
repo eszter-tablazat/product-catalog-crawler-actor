@@ -1030,8 +1030,9 @@ function extractJsonLdProducts($, url) {
             properties.gtin = valueText(node.gtin || node.gtin13 || node.gtin14 || node.gtin8);
           }
 
+          const rawOfferPrice = valueText(offer.price);
           const price = firstNonEmpty(
-            offer.price,
+            Number(rawOfferPrice) === 0 && rawOfferPrice !== '' ? '' : rawOfferPrice,
             offer.lowPrice && offer.highPrice ? `${offer.lowPrice} - ${offer.highPrice}` : '',
             aggregateOffer.lowPrice && aggregateOffer.highPrice ? `${aggregateOffer.lowPrice} - ${aggregateOffer.highPrice}` : '',
           );
@@ -1051,8 +1052,12 @@ function extractJsonLdProducts($, url) {
             price: price ? `${price}${currency ? ` ${currency}` : ''}` : null,
             price_vat_status: priceVatStatus,
             currency: currency || null,
-            category: valueText(node.category) || null,
-            description: truncate(stripHtml(valueText(node.description)), 3000),
+            category: valueText(node.category) || extractCategory($, valueText(node.name)) || categoryFromUrlPath($, url) || null,
+            description: truncate(firstNonEmpty(
+              stripHtml(valueText(node.description)),
+              $('meta[name="description"]').attr('content'),
+              extractMainContentText($),
+            ), 3000),
             images: normalizeImages(node.image, url),
             properties,
             variants: [],
@@ -1164,12 +1169,60 @@ function inferSku($, properties) {
   return match ? match[1] : null;
 }
 
-function extractCategory($) {
-  const breadcrumbs = $('.breadcrumb a, .breadcrumbs a, nav[aria-label*="breadcrumb"] a, [class*="breadcrumb"] a')
-    .map((_i, el) => cleanText($(el).text()))
-    .get()
-    .filter((item) => item && !/^home|főoldal|kezdőlap$/i.test(item));
-  return breadcrumbs.length ? breadcrumbs.slice(-2).join(' > ') : null;
+function extractCategory($, productName = '') {
+  const genericRoots = new Set([
+    'home', 'főoldal', 'kezdőlap', 'kezdolap', 'fooldal',
+    'termékek', 'termekek', 'products', 'shop', 'webshop', 'áruház', 'aruhaz',
+    'értékesítés', 'ertekesites', 'kategóriák', 'kategoriak', 'katalógus', 'katalogus',
+  ]);
+  const own = cleanText(productName).toLowerCase();
+  const scope = $('.breadcrumb, .breadcrumbs, nav[aria-label*="breadcrumb" i], [class*="breadcrumb"]').first();
+  if (!scope.length) return null;
+  const crumbs = scope.find('li').length
+    ? scope.find('li').map((_i, el) => cleanText($(el).text())).get()
+    : scope.find('a').map((_i, el) => cleanText($(el).text())).get();
+  const path = unique(crumbs.filter(Boolean))
+    .filter((item) => item.toLowerCase() !== own)
+    .filter((item) => !genericRoots.has(item.toLowerCase()));
+  return path.length ? path.join(' > ') : null;
+}
+
+// No breadcrumb: rebuild the category path from the URL's parent segments, using the
+// site's own link text for each parent path (e.g. /termekek/<category>/<product>).
+function categoryFromUrlPath($, url) {
+  let segments;
+  try {
+    segments = new URL(url).pathname.replace(/\/$/, '').split('/').filter(Boolean);
+  } catch {
+    return null;
+  }
+  if (segments.length < 2) return null;
+  const linkText = new Map();
+  $('a[href]').each((_i, el) => {
+    try {
+      const path = new URL($(el).attr('href'), url).pathname.replace(/\/$/, '').toLowerCase();
+      const text = cleanText($(el).text());
+      if (text && !linkText.has(path)) linkText.set(path, text);
+    } catch {
+      // ignore malformed links
+    }
+  });
+  const genericRoots = categorySegments();
+  const names = [];
+  for (let i = 1; i < segments.length; i += 1) {
+    const prefix = `/${segments.slice(0, i).join('/')}`.toLowerCase();
+    let decoded = segments[i - 1];
+    try {
+      decoded = decodeURIComponent(decoded).toLowerCase();
+    } catch {
+      decoded = decoded.toLowerCase();
+    }
+    if (i === 1 && (genericRoots.has(decoded) || ['ertekesites', 'értékesítés', 'shop', 'webshop'].includes(decoded))) continue;
+    const name = linkText.get(prefix) || linkText.get(encodeURI(decodeURIComponent(prefix)).toLowerCase());
+    if (!name) return names.length ? names.join(' > ') : null;
+    names.push(name);
+  }
+  return names.length ? names.join(' > ') : null;
 }
 
 function siteBrand($) {
@@ -1439,7 +1492,7 @@ function extractDomProduct($, url) {
     price: priceText,
     price_vat_status: priceInfoResult?.price_vat_status || 'ismeretlen',
     currency: null,
-    category: extractCategory($),
+    category: extractCategory($, title) || categoryFromUrlPath($, url),
     description: truncate(cleanDescription, 3000),
     images: extractProductImages($, url),
     properties,
@@ -1654,7 +1707,8 @@ async function crawlHtmlFallback(options) {
       pageCount += 1;
       const url = request.loadedUrl || request.url;
 
-      for (const product of extractJsonLdProducts($, url)) {
+      const jsonLdProducts = extractJsonLdProducts($, url);
+      for (const product of jsonLdProducts) {
         await pushProduct(product);
       }
       for (const product of extractListingProducts($, url)) {
@@ -1664,7 +1718,9 @@ async function crawlHtmlFallback(options) {
           return;
         }
       }
-      const domProduct = extractDomProduct($, url);
+      // JSON-LD is authoritative; the DOM heuristic is only a fallback (avoids duplicates
+      // with a different, wrongly picked title on the same URL).
+      const domProduct = jsonLdProducts.length ? null : extractDomProduct($, url);
       if (domProduct) await pushProduct(domProduct);
 
       if (productCount >= options.maxProducts) {
