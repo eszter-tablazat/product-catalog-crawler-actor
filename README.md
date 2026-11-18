@@ -182,6 +182,14 @@ Each dataset item is one normalized product:
 The Actor is built automatically by Apify on every push to `main`
 (Source → Build settings → Automatic builds).
 
+## v1.2.17
+
+- Faster default pace: `maxRequestsPerMinute` 30 (was 6), `sameDomainDelaySecs` 2 (was 10).
+  A 170-page site (sensorcontrol.hu) now finishes in ~6 min instead of ~35 min, so it
+  fits the run timeout instead of stopping on `time_budget` with partial data.
+- Adaptive slowdown: on HTTP 429/503 from the target the delay doubles (min 5 s, max 30 s)
+  for the rest of the run; noted in `SUMMARY.warnings`.
+
 ## v1.2.16
 
 - Sequential `product_details.php?id=N` seeding only when at least 2 of ids 1–3

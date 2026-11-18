@@ -27,8 +27,8 @@ const DEFAULTS = {
   maxProducts: 5000,
   maxPages: 1000,
   maxConcurrency: 1,
-  maxRequestsPerMinute: 6,
-  sameDomainDelaySecs: 10,
+  maxRequestsPerMinute: 30,
+  sameDomainDelaySecs: 2,
   maxRequestRetries: 8,
   proxyMode: 'auto',
   proxyCountry: 'HU',
@@ -290,8 +290,8 @@ input.defaultVatStatus = normalizeVatStatus(
   'ismeretlen',
 );
 input.maxConcurrency = boundedInteger(input.maxConcurrency, 1, 1, 20);
-input.maxRequestsPerMinute = boundedInteger(input.maxRequestsPerMinute, 6, 1, 600);
-input.sameDomainDelaySecs = boundedInteger(input.sameDomainDelaySecs, 10, 0, 120);
+input.maxRequestsPerMinute = boundedInteger(input.maxRequestsPerMinute, 30, 1, 600);
+input.sameDomainDelaySecs = boundedInteger(input.sameDomainDelaySecs, 2, 0, 120);
 input.maxRequestRetries = boundedInteger(input.maxRequestRetries, 8, 0, 20);
 input.proxyMode = String(process.env.PROXY_MODE || input.proxyMode || 'auto').trim().toLowerCase();
 if (!['none', 'auto', 'residential'].includes(input.proxyMode)) input.proxyMode = 'auto';
@@ -309,6 +309,8 @@ const canonicalByGroup = new Map();
 let productCount = 0;
 let pageCount = 0;
 let nextTargetFetchAt = 0;
+let adaptiveDelayMs = 0;
+const ADAPTIVE_MAX_DELAY_MS = 30000;
 let targetDirectFetchBlocked = false;
 let sharedProxyConfiguration;
 let proxyConfigurationResolved = false;
@@ -432,6 +434,22 @@ function wait(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// Adaptive politeness: start fast, slow down when the target signals rate limiting.
+
+function registerTargetThrottleSignal(url, statusCode) {
+  if (![429, 503].includes(Number(statusCode))) return;
+  try {
+    if (hostKey(url) !== targetHost) return;
+  } catch {
+    return;
+  }
+  const previous = Math.max(input.sameDomainDelaySecs * 1000, adaptiveDelayMs);
+  adaptiveDelayMs = Math.min(ADAPTIVE_MAX_DELAY_MS, Math.max(5000, previous * 2));
+  const warning = `HTTP ${statusCode} from target; slowing down to ${Math.round(adaptiveDelayMs / 1000)}s between requests`;
+  if (!summary.warnings.includes(warning)) summary.warnings.push(warning);
+  log.warning(warning, { url });
+}
+
 async function paceTargetRequest(url) {
   try {
     if (hostKey(url) !== targetHost) return;
@@ -439,7 +457,7 @@ async function paceTargetRequest(url) {
     return;
   }
 
-  const delayMs = input.sameDomainDelaySecs * 1000;
+  const delayMs = Math.max(input.sameDomainDelaySecs * 1000, adaptiveDelayMs);
   if (delayMs <= 0) return;
 
   const scheduledAt = Math.max(Date.now(), nextTargetFetchAt);
@@ -1625,6 +1643,11 @@ async function crawlHtmlFallback(options) {
     preNavigationHooks: [
       async ({ request }) => {
         await paceTargetRequest(request.url);
+      },
+    ],
+    postNavigationHooks: [
+      async ({ request, response }) => {
+        registerTargetThrottleSignal(request.url, response?.statusCode);
       },
     ],
     async requestHandler({ $, request, enqueueLinks }) {
