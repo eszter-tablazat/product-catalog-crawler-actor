@@ -182,6 +182,16 @@ Each dataset item is one normalized product:
 The Actor is built automatically by Apify on every push to `main`
 (Source → Build settings → Automatic builds).
 
+## v1.2.16
+
+- Sequential `product_details.php?id=N` seeding only when at least 2 of ids 1–3
+  look like real product pages (visible body text, not meta tags; soft-404s rejected).
+  Fixes logisys.hu, where a 404 template's `og:url` produced 300 fake seeds.
+- Catalog leaf pages (`/termekek/<category>/<product>`, few child links) with
+  ≥150 chars of descriptive text count as products even without price/cart.
+- Description falls back to the main content text around the H1.
+- Soft-404 pages (title/H1 "404", "nem található", "not found") are never saved as products.
+
 ## v1.2.15
 
 - Time-budget reserve is 10% of the Actor timeout (min 30 s, max 180 s)

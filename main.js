@@ -1343,7 +1343,49 @@ function extractListingProducts($, url) {
   return products;
 }
 
+
+function categorySegments() {
+  return new Set(CATEGORY_URL_HINTS.map((hint) => hint.replace(/\//g, '').toLowerCase()).filter(Boolean));
+}
+
+// /termekek/<category>/<product> style page that is not itself a listing of children.
+function isCatalogLeafPage($, url) {
+  let path;
+  try {
+    path = decodeURIComponent(new URL(url).pathname).toLowerCase().replace(/\/$/, '');
+  } catch {
+    return false;
+  }
+  const segments = path.split('/').filter(Boolean);
+  const rootIndex = segments.findIndex((segment) => categorySegments().has(segment));
+  if (rootIndex < 0 || segments.length - rootIndex < 3) return false;
+  const childLinks = new Set();
+  $('a[href]').each((_i, el) => {
+    try {
+      const childPath = decodeURIComponent(new URL($(el).attr('href'), url).pathname).toLowerCase().replace(/\/$/, '');
+      if (childPath.startsWith(`${path}/`)) childLinks.add(childPath);
+    } catch {
+      // ignore malformed links
+    }
+  });
+  return childLinks.size < 3;
+}
+
+function extractMainContentText($) {
+  const h1 = $('h1').first();
+  if (!h1.length) return '';
+  let container = h1.parent();
+  for (let i = 0; i < 4 && container.length && cleanText(container.text()).length < 200; i += 1) {
+    container = container.parent();
+  }
+  if (!container.length || container.is('body, html')) return '';
+  const clone = container.clone();
+  clone.find('script, style, noscript, nav, header, footer, form, table, h1, .breadcrumb, .menu, .mean-container').remove();
+  return cleanText(clone.text());
+}
+
 function extractDomProduct($, url) {
+  if (isNotFoundPage($)) return null;
   const title = cleanProductName(extractPageTitle($));
   const platform = detectPlatform($, url);
   const properties = extractProperties($);
@@ -1359,9 +1401,13 @@ function extractDomProduct($, url) {
     $('[itemprop="description"]').first().attr('content'),
     $('[itemprop="description"]').first().text(),
     $('.summary, .description, .product-description, .short-description, .product-short-description, [class*="description"]').first().text(),
+    extractMainContentText($),
   );
   const cleanDescription = stripHtml(description);
-  const confidence = productConfidence({ $, url, title, priceText, properties, sku, description: cleanDescription });
+  let confidence = productConfidence({ $, url, title, priceText, properties, sku, description: cleanDescription });
+  // Catalog sites without prices/cart (e.g. B2B manufacturer pages): a leaf page under the
+  // product catalog path with a real title and descriptive text is a product.
+  if (isCatalogLeafPage($, url) && cleanDescription.length >= 150) confidence += 40;
   if (!title || confidence < 55) return null;
 
   return {
@@ -1465,8 +1511,21 @@ async function seedFromSitemaps(options) {
     .slice(0, options.maxPages);
 }
 
-function looksLikeProductDetailHtml(text) {
-  const lower = cleanText(text).toLowerCase();
+function isNotFoundPage($) {
+  const signals = cleanText([
+    $('title').first().text(),
+    $('meta[property="og:title"]').attr('content') || '',
+    $('h1').first().text(),
+  ].join(' ')).toLowerCase();
+  return /(^|\D)404(\D|$)|nem található|nem talalhato|nem létezik|not found|page not found/.test(signals);
+}
+
+function looksLikeProductDetailHtml(html) {
+  const $ = cheerio.load(String(html || ''));
+  if (isNotFoundPage($)) return false;
+  $('head, script, style, noscript').remove();
+  // Only visible body text counts: meta tags / og:url of a 404 template must not trigger.
+  const lower = cleanText($('body').text()).toLowerCase();
   const markers = [
     'bruttó termék ár',
     'brutto termek ar',
@@ -1496,9 +1555,13 @@ async function seedFromGeneratedProductIds(options) {
   );
 
   for (const pattern of patterns) {
-    const firstUrl = pattern.replace('{id}', '1');
-    const sample = await fetchText(firstUrl);
-    if (!sample || !looksLikeProductDetailHtml(sample)) continue;
+    // Probe several ids; a single (possibly soft-404) page is not proof of a live pattern.
+    let hits = 0;
+    for (const id of [1, 2, 3]) {
+      const sample = await fetchText(pattern.replace('{id}', String(id)));
+      if (sample && looksLikeProductDetailHtml(sample)) hits += 1;
+    }
+    if (hits < 2) continue;
     log.info(`Sequential product detail pattern detected: ${pattern}`);
     return Array.from({ length: limit }, (_item, index) => pattern.replace('{id}', String(index + 1)));
   }
