@@ -182,6 +182,26 @@ Each dataset item is one normalized product:
 The Actor is built automatically by Apify on every push to `main`
 (Source → Build settings → Automatic builds).
 
+## v1.2.19
+
+- Multilingual sites: the crawl stays inside the start URL's language path (`/hu`, `/hu/hu`).
+  Disable with input `restrictToLocalePath: false`. (doerken.com crawled every language.)
+- Sitemaps: language-specific sitemap first (robots.txt may list 25 locales), gzipped
+  `*.xml.gz` sitemaps supported, retry on 503, a sitemap index only reads the matching
+  language. (lutz-jesco.com: 1600+ HU product URLs were never found.)
+- Product detail URLs are queued first, so a time-limited run spends its budget on products.
+- Listing cards: Shopware `.product-box`, cards wrapped in a link, `h1` card titles; card
+  links must be on the target site (no `facebook.com/sharer` links), no image/lightbox links.
+- A listing/category page no longer yields a fake product named after its first card
+  (lutz-jesco.com). A detail page with "related products" cards is still a product when it
+  has its own spec table or SKU (leotrade.hu).
+- Title: header phone numbers/e-mails, share texts and "Műszaki adatok" are skipped; the
+  `<h1>` matching `<title>` wins; `" | site.hu"` titles count as empty; sites with no title
+  fall back to the first bold line of the main content (biocenter.hu).
+- Category: "Kezdőoldal" ignored; `» A » B` heading used as breadcrumb.
+- SKU: `Rendelési kód` / `Order code` recognised.
+- Direct (non-proxy) fetches time out after 30 s.
+
 ## v1.2.18
 
 - Category = full breadcrumb path (e.g. `Telepített gázérzékelők > Gázérzékelő fejek > MSA`),

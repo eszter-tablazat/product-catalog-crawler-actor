@@ -2,6 +2,7 @@ import { gotScraping } from 'got-scraping';
 import { Actor } from 'apify';
 import { CheerioCrawler, log } from 'crawlee';
 import * as cheerio from 'cheerio';
+import { gunzipSync } from 'node:zlib';
 import {
   PRODUCT_PRICE_LABELS,
   SERVICE_PRICE_LABELS,
@@ -228,6 +229,25 @@ const PRODUCT_CONTAINER_SELECTORS = [
   '[class*="product_detail"]',
 ];
 
+const LISTING_CARD_SELECTORS = [
+  '.product-card',
+  '.product-item',
+  '.product-list-item',
+  '.product-grid-item',
+  '.card-product',
+  '.collection-product',
+  '.catalog-product',
+  '.product-box',
+  '.termek',
+  '[class*="product-card"]',
+  '[class*="product_item"]',
+  '[class*="product-item"]',
+  '[class*="product-box"]',
+  '[class*="termek"]',
+  '[data-product-id]',
+  '[data-product]',
+];
+
 const PROPERTY_BLOCK_SELECTORS = [
   '.specifications',
   '.specification',
@@ -304,6 +324,9 @@ if (!input.startUrl) {
 const startUrl = normalizeUrl(input.startUrl);
 const origin = new URL(startUrl).origin;
 const targetHost = hostKey(startUrl);
+// Multilingual sites (e.g. /hu, /hu/hu/start): stay inside the start URL's language
+// path, otherwise the crawl wanders into /de, /fr ... versions of the same catalog.
+const scopePrefix = input.restrictToLocalePath === false ? '' : localePathPrefix(startUrl);
 const seenProducts = new Set();
 const canonicalByGroup = new Map();
 let productCount = 0;
@@ -338,6 +361,7 @@ const summary = {
     mode: input.proxyMode,
     country: input.proxyMode === 'residential' ? input.proxyCountry : null,
   },
+  scopePrefix: scopePrefix || null,
   webhook: {
     enabled: Boolean(input.webhookUrl),
     deliveredProducts: 0,
@@ -400,11 +424,37 @@ function sameDomain(value) {
   }
 }
 
+function localePathPrefix(value) {
+  try {
+    const segments = new URL(value).pathname.split('/').filter(Boolean);
+    const locale = [];
+    for (const segment of segments) {
+      if (!/^[a-z]{2}(?:[-_][a-z]{2,4})?$/i.test(segment)) break;
+      locale.push(segment.toLowerCase());
+    }
+    return locale.length ? `/${locale.join('/')}` : '';
+  } catch {
+    return '';
+  }
+}
+
+function inScope(value) {
+  if (!scopePrefix) return true;
+  try {
+    const path = new URL(value).pathname.toLowerCase().replace(/\/$/, '');
+    return path === scopePrefix || path.startsWith(`${scopePrefix}/`);
+  } catch {
+    return false;
+  }
+}
+
 function shouldSkipUrl(value) {
   const lower = decodeURIComponent(String(value)).toLowerCase();
   if (!sameDomain(value)) return true;
+  if (!inScope(value)) return true;
   if (BAD_URL_HINTS.some((hint) => lower.includes(hint))) return true;
-  if (MEDIA_EXTENSIONS.some((ext) => lower.split('?')[0].endsWith(ext))) return true;
+  if (MEDIA_EXTENSIONS.some((ext) => lower.split('?')[0].endsWith(ext) || lower.endsWith(ext))) return true;
+  if (/_img\.php|\/image\.php|\/thumb(?:nail)?\.php/.test(lower)) return true;
   return false;
 }
 
@@ -474,7 +524,7 @@ async function fetchWithPacing(url, init) {
   const proxyConfiguration = isTargetRequest ? await getProxyConfiguration(input) : null;
   const response = proxyConfiguration
     ? await fetchViaProxy(url, init, proxyConfiguration)
-    : await fetch(url, init);
+    : await fetch(url, { ...init, signal: AbortSignal.timeout(30000) });
   if (response.status === 429 && isTargetRequest) {
     targetDirectFetchBlocked = true;
     const warning = `HTTP 429 during direct discovery: ${url}; switching to proxy crawler`;
@@ -499,14 +549,17 @@ async function fetchViaProxy(url, init = {}, proxyConfiguration) {
     followRedirect: true,
     timeout: { request: 30000 },
     retry: { limit: 1 },
+    responseType: 'buffer',
   });
-  const body = typeof res.body === 'string' ? res.body : String(res.body ?? '');
+  const raw = Buffer.isBuffer(res.body) ? res.body : Buffer.from(String(res.body ?? ''));
+  const body = raw.toString('utf8');
   return {
     ok: res.statusCode >= 200 && res.statusCode < 300,
     status: res.statusCode,
     headers: res.headers,
     text: async () => body,
     json: async () => JSON.parse(body),
+    arrayBuffer: async () => raw,
   };
 }
 
@@ -1165,26 +1218,38 @@ function inferSku($, properties) {
   if (direct) return direct;
 
   const text = cleanText($('body').text());
-  const match = text.match(/(?:SKU|Cikksz[áa]m|Term[ée]kk[óo]d|Article(?:\s+no\.?)?)[:\s#-]{1,10}([A-Za-z0-9._/-]{3,80})/i);
+  const match = text.match(/(?:SKU|Cikksz[áa]m|Term[ée]kk[óo]d|Rendel[ée]si\s+(?:k[óo]d|sz[áa]m)|Order\s+(?:code|no\.?)|Article(?:\s+no\.?)?)[:\s#»-]{1,10}([A-Za-z0-9._/-]{3,80})/i);
   return match ? match[1] : null;
 }
 
 function extractCategory($, productName = '') {
   const genericRoots = new Set([
-    'home', 'főoldal', 'kezdőlap', 'kezdolap', 'fooldal',
+    'home', 'főoldal', 'kezdőlap', 'kezdolap', 'fooldal', 'kezdőoldal', 'kezdooldal', 'startseite', 'start',
     'termékek', 'termekek', 'products', 'shop', 'webshop', 'áruház', 'aruhaz',
     'értékesítés', 'ertekesites', 'kategóriák', 'kategoriak', 'katalógus', 'katalogus',
   ]);
   const own = cleanText(productName).toLowerCase();
-  const scope = $('.breadcrumb, .breadcrumbs, nav[aria-label*="breadcrumb" i], [class*="breadcrumb"]').first();
-  if (!scope.length) return null;
-  const crumbs = scope.find('li').length
-    ? scope.find('li').map((_i, el) => cleanText($(el).text())).get()
-    : scope.find('a').map((_i, el) => cleanText($(el).text())).get();
-  const path = unique(crumbs.filter(Boolean))
+  const clean = (items) => unique(items.filter(Boolean))
     .filter((item) => item.toLowerCase() !== own)
     .filter((item) => !genericRoots.has(item.toLowerCase()));
-  return path.length ? path.join(' > ') : null;
+  const scope = $('.breadcrumb, .breadcrumbs, nav[aria-label*="breadcrumb" i], [class*="breadcrumb"]').first();
+  if (scope.length) {
+    const crumbs = scope.find('li').length
+      ? scope.find('li').map((_i, el) => cleanText($(el).text())).get()
+      : scope.find('a').map((_i, el) => cleanText($(el).text())).get();
+    const path = clean(crumbs);
+    if (path.length) return path.join(' > ');
+  }
+  // Pseudo-breadcrumb heading: "» Laboratóriumi műanyagáru » Tartók, rackek, dobozok".
+  let chain = null;
+  mainContentScope($).find('h2, h3, h4, h5').each((_i, el) => {
+    if (chain) return;
+    const text = cleanText($(el).text());
+    if (text.length > 200 || !/^[»›]/.test(text)) return;
+    const parts = clean(text.split(/\s*[»›]\s*/));
+    if (parts.length) chain = parts.join(' > ');
+  });
+  return chain;
 }
 
 // No breadcrumb: rebuild the category path from the URL's parent segments, using the
@@ -1235,6 +1300,36 @@ function siteBrand($) {
   return brand || hostKey(startUrl).split('.')[0];
 }
 
+function stripSiteBrand(title, $) {
+  let clean = cleanText(title);
+  const brands = unique([siteBrand($), hostKey(startUrl), `www.${hostKey(startUrl)}`].map((b) => cleanText(b).toLowerCase()));
+  for (const brand of brands) {
+    if (!brand) continue;
+    const pattern = new RegExp(`(^\\s*${escapeRegex(brand)}\\s*[|\\-–—:•»]+\\s*|\\s*[|\\-–—:•»]+\\s*${escapeRegex(brand)}\\s*$)`, 'i');
+    clean = clean.replace(pattern, '');
+  }
+  return cleanText(clean.replace(/^[\s|\-–—:•»]+|[\s|\-–—:•»]+$/g, ''));
+}
+
+function escapeRegex(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// Header contact lines, share buttons and section headings are not product names.
+function isJunkTitle(title) {
+  const clean = cleanText(title);
+  if (!clean) return true;
+  if (/^[+()\d\s./-]{7,}$/.test(clean)) return true; // phone number
+  if (/^\S+@\S+\.\S+$/.test(clean)) return true; // e-mail
+  if (/^(https?:\/\/|www\.)/i.test(clean)) return true;
+  const folded = clean.toLowerCase();
+  if (/(megoszt|ossza meg|share on|share this|facebook|twitter|linkedin|pinterest)/i.test(folded)) return true;
+  return [
+    'műszaki adatok', 'muszaki adatok', 'technical data', 'termékleírás', 'leírás', 'description',
+    'kapcsolat', 'contact', 'kosár', 'kosar', 'cart', 'menü', 'menu', 'keresés', 'search',
+  ].includes(folded);
+}
+
 function isGenericTitle(title, $) {
   const clean = cleanText(title).toLowerCase();
   const brand = siteBrand($).toLowerCase();
@@ -1242,10 +1337,31 @@ function isGenericTitle(title, $) {
   if (clean === brand) return true;
   if (clean === hostKey(startUrl).toLowerCase()) return true;
   if (clean.length < 3) return true;
+  if (isJunkTitle(clean)) return true;
+  if (stripSiteBrand(clean, $).length < 3) return true;
   return false;
 }
 
-function extractPageTitle($) {
+function mainContentScope($) {
+  const main = $('main, [role="main"], #main, .main, #content, .content').first();
+  return main.length ? main : $('body');
+}
+
+// Sites without a usable <h1>/<title> (e.g. biocenter.hu: " | biocenter.hu"): first bold
+// line of the main content, outside navigation/sidebars.
+function boldTitleFallback($) {
+  const scope = mainContentScope($).clone();
+  scope.find('nav, aside, header, footer, form, script, style, .breadcrumb, .sidebar, .menu').remove();
+  let found = '';
+  scope.find('b, strong, .card-title, h2, h3').each((_i, el) => {
+    if (found) return;
+    const text = cleanText($(el).text());
+    if (text.length >= 3 && text.length <= 160 && !isJunkTitle(text) && !/[»›]/.test(text) && !/[:：]$/.test(text)) found = text;
+  });
+  return found;
+}
+
+function extractPageTitle($, url = '') {
   const productScope = $('[itemscope][itemtype*="Product"]').first();
   const productScopedTitle = productScope.length
     ? firstNonEmpty(
@@ -1255,14 +1371,34 @@ function extractPageTitle($) {
     )
     : '';
 
-  return firstNonEmpty(
+  // Product-name classes are only trustworthy when the page has exactly one of them;
+  // on listing pages (Shopware .product-name x20) the first card name was taken as the page title.
+  const nameSelector = '.product-title, .product-name, .product-detail-title, .p-name, [class*="product-title"], [class*="product-name"]';
+  const outsideCards = (_i, el) => !$(el).closest('[data-pcc-card]').length;
+  const containerName = $(PRODUCT_CONTAINER_SELECTORS.join(', ')).filter(outsideCards).first().find(nameSelector).first().text();
+  const nameEls = $(nameSelector).filter(outsideCards).filter((_i, el) => !$(el).parents(nameSelector).length);
+  const singleName = nameEls.length === 1 ? nameEls.first().text() : '';
+
+  const docTitle = stripSiteBrand($('title').first().text(), $);
+  const ogTitle = stripSiteBrand($('meta[property="og:title"]').attr('content'), $);
+  const h1s = $('h1').map((_i, el) => cleanText($(el).text())).get().filter((t) => !isJunkTitle(t));
+  const docFold = docTitle.toLowerCase();
+  const matchingH1 = h1s.find((t) => docFold && (docFold.includes(t.toLowerCase()) || t.toLowerCase().includes(docFold)));
+  const mainH1 = $('main h1, [role="main"] h1').map((_i, el) => cleanText($(el).text())).get().find((t) => !isJunkTitle(t));
+
+  const candidate = firstNonEmpty(
     productScopedTitle,
-    $('.product-title, .product-name, .product-detail-title, .p-name, [class*="product-title"], [class*="product-name"]').first().text(),
-    $('main h1').first().text(),
-    $('h1').first().text(),
-    $('meta[property="og:title"]').attr('content'),
-    $('title').text(),
+    containerName,
+    singleName,
+    matchingH1,
+    mainH1,
+    h1s[0],
+    ogTitle,
+    docTitle,
   );
+  if (candidate && !isJunkTitle(candidate) && stripSiteBrand(candidate, $).length >= 3) return candidate;
+  if (url && scoreUrl(url) >= 100) return boldTitleFallback($);
+  return candidate;
 }
 
 function countSignals(pageText) {
@@ -1320,22 +1456,7 @@ function extractListingProducts($, url) {
   const seenCards = new Set();
   const platform = detectPlatform($, url);
   const category = extractCategory($);
-  const selectors = [
-    '.product-card',
-    '.product-item',
-    '.product-list-item',
-    '.product-grid-item',
-    '.card-product',
-    '.collection-product',
-    '.catalog-product',
-    '.termek',
-    '[class*="product-card"]',
-    '[class*="product_item"]',
-    '[class*="product-item"]',
-    '[class*="termek"]',
-    '[data-product-id]',
-    '[data-product]',
-  ];
+  const selectors = LISTING_CARD_SELECTORS;
 
   for (const selector of selectors) {
     $(selector).each((_i, card) => {
@@ -1343,7 +1464,9 @@ function extractListingProducts($, url) {
       const text = cleanText($card.text());
       if (!text || text.length < 5) return;
 
-      const linkEl = $card.find('a[href]').toArray()
+      // Cards wrapped in a link (<a href><div class="product-box">…</div></a>, leotrade.hu).
+      const wrappingLink = $card.closest('a[href]');
+      const linkEl = [...$card.find('a[href]').toArray(), ...wrappingLink.toArray()]
         .map((el) => {
           const href = $(el).attr('href');
           try {
@@ -1351,6 +1474,7 @@ function extractListingProducts($, url) {
               href,
               absUrl: href ? new URL(href, url).toString() : '',
               text: cleanText($(el).attr('title') || $(el).text()),
+              isLightbox: /fancybox|lightbox|gallery|zoom/i.test(`${$(el).attr('class') || ''} ${$(el).attr('rel') || ''} ${$(el).attr('data-fancybox') !== undefined ? 'fancybox' : ''}`),
             };
           } catch {
             return null;
@@ -1358,24 +1482,29 @@ function extractListingProducts($, url) {
         })
         .filter(Boolean)
         .filter((item) => item.href && !/^(#|javascript:|mailto:|tel:)/i.test(item.href))
+        // Share buttons (facebook.com/sharer...?u=<product url>) scored high on the embedded URL.
+        .filter((item) => !item.isLightbox && !shouldSkipUrl(item.absUrl) && !isJunkTitle(item.text || 'x'))
         .sort((a, b) => scoreUrl(b.absUrl) - scoreUrl(a.absUrl))[0];
+      if (!linkEl) return;
 
       const title = firstNonEmpty(
         $card.find('[itemprop="name"]').first().attr('content'),
         $card.find('[itemprop="name"]').first().text(),
-        $card.find('.product-title, .product-name, .card-title, .title, .name, h2, h3, h4').first().text(),
+        $card.find('.product-title, .product-name, .card-title, .title, .name, h1, h2, h3, h4').first().text(),
         linkEl?.text,
       );
       const cleanTitle = cleanProductName(title);
       if (!cleanTitle || cleanTitle.length > 220) return;
       if (isGenericTitle(cleanTitle, $)) return;
+      if (shouldSkipUrl(linkEl.absUrl)) return;
 
-      const productUrl = linkEl?.absUrl || url;
+      const productUrl = linkEl.absUrl;
       const cardUrlScore = scoreUrl(productUrl);
       const cardHasProductMarker = $card.find('[itemprop="sku"], [itemprop="price"], [data-product-id], [data-sku], .price, .product-price, .add-to-cart, .kosarba').length > 0;
       if (cardUrlScore < 50 && !cardHasProductMarker) return;
 
       const key = `${productUrl}|${cleanTitle}`;
+      $card.attr('data-pcc-card', '1');
       if (seenCards.has(key)) return;
       seenCards.add(key);
 
@@ -1442,6 +1571,23 @@ function isCatalogLeafPage($, url) {
   return childLinks.size < 3;
 }
 
+// A product detail page may also show 'related products' cards. It is a real detail page
+// when, after removing all cards, it still has its own spec table or SKU.
+function hasOwnProductDetail($) {
+  const $own = cheerio.load($.html());
+  $own('[data-pcc-card]').remove();
+  $own('header, footer, nav, aside').remove();
+  // Key-value spec rows only (2 cells / dt-dd). Multi-column rows are comparison tables of
+  // the listed products (lutz-jesco.com category pages), not this page's own specs.
+  let specRows = 0;
+  $own('table tr').each((_i, tr) => {
+    if ($own(tr).children('th,td').length === 2 && cleanText($own(tr).text()).length > 3) specRows += 1;
+  });
+  specRows += $own('dl dt').length;
+  if (specRows >= 3) return true;
+  return Boolean(inferSku($own, {}));
+}
+
 function extractMainContentText($) {
   const h1 = $('h1').first();
   if (!h1.length) return '';
@@ -1457,7 +1603,7 @@ function extractMainContentText($) {
 
 function extractDomProduct($, url) {
   if (isNotFoundPage($)) return null;
-  const title = cleanProductName(extractPageTitle($));
+  const title = cleanProductName(extractPageTitle($, url));
   const platform = detectPlatform($, url);
   const properties = extractProperties($);
   const isServiceRecord = hasStrongServiceMarker($, url);
@@ -1525,9 +1671,33 @@ async function seedFromFirecrawlMap(options) {
   }
 }
 
+// Sitemaps are often served gzipped as application/octet-stream (*.xml.gz, e.g. Shopware).
+async function fetchSitemapText(url, attempt = 1) {
+  try {
+    const response = await fetchWithPacing(url, {
+      headers: {
+        accept: 'application/xml,text/xml,application/gzip,*/*',
+        'user-agent': 'ProductCatalogCrawler/1.0 (+https://apify.com)',
+      },
+    });
+    // On-demand generated sitemaps answer 503 now and then (doerken.com /hu/hu/sitemap.xml).
+    if (response && [429, 500, 502, 503, 504].includes(Number(response.status)) && attempt < 3) {
+      await wait(3000 * attempt);
+      return fetchSitemapText(url, attempt + 1);
+    }
+    if (!response?.ok) return null;
+    const raw = Buffer.from(await response.arrayBuffer());
+    if (raw.length > 2 && raw[0] === 0x1f && raw[1] === 0x8b) return gunzipSync(raw).toString('utf8');
+    return raw.toString('utf8');
+  } catch (error) {
+    summary.warnings.push(`Sitemap fetch failed: ${url} - ${error.message}`);
+    return null;
+  }
+}
+
 async function parseSitemap(url, depth = 0) {
   if (depth > 2) return [];
-  const text = await fetchText(url, { accept: 'application/xml,text/xml,*/*' });
+  const text = await fetchSitemapText(url);
   if (!text || !isLikelyXml(text)) return [];
 
   const $xml = cheerio.load(text, { xmlMode: true });
@@ -1537,8 +1707,12 @@ async function parseSitemap(url, depth = 0) {
   const urls = [];
   $xml('url loc').each((_i, el) => urls.push(cleanText($xml(el).text())));
 
-  for (const childUrl of sitemapUrls.slice(0, 30)) {
-    if (!sameDomain(childUrl)) continue;
+  let childSitemaps = sitemapUrls.filter((childUrl) => sameDomain(childUrl));
+  // Sitemap index of a multilingual site: read only the start URL's language sitemaps.
+  if (scopePrefix && childSitemaps.some((childUrl) => inScope(childUrl))) {
+    childSitemaps = childSitemaps.filter((childUrl) => inScope(childUrl));
+  }
+  for (const childUrl of childSitemaps.slice(0, 30)) {
     urls.push(...await parseSitemap(childUrl, depth + 1));
   }
 
@@ -1551,8 +1725,12 @@ async function seedFromSitemaps(options) {
     .split(/\r?\n/)
     .map((line) => line.match(/^\s*sitemap\s*:\s*(\S+)/i)?.[1])
     .filter(Boolean);
+  // Language-specific sitemaps first (robots.txt may list 25 locales; /hu/sitemap.xml was last).
+  const scopedRobotsSitemaps = robotsSitemaps.filter((url) => sameDomain(url) && scopePrefix && inScope(url));
   const candidates = unique([
-    ...robotsSitemaps,
+    ...scopedRobotsSitemaps,
+    scopePrefix ? `${origin}${scopePrefix}/sitemap.xml` : '',
+    ...robotsSitemaps.filter((url) => !scopedRobotsSitemaps.includes(url)),
     `${origin}/sitemap.xml`,
     `${origin}/sitemap_index.xml`,
     `${origin}/product-sitemap.xml`,
@@ -1711,7 +1889,8 @@ async function crawlHtmlFallback(options) {
       for (const product of jsonLdProducts) {
         await pushProduct(product);
       }
-      for (const product of extractListingProducts($, url)) {
+      const listingProducts = extractListingProducts($, url);
+      for (const product of listingProducts) {
         await pushProduct(product);
         if (productCount >= options.maxProducts) {
           stopOnMaxProducts(crawler, options);
@@ -1720,7 +1899,9 @@ async function crawlHtmlFallback(options) {
       }
       // JSON-LD is authoritative; the DOM heuristic is only a fallback (avoids duplicates
       // with a different, wrongly picked title on the same URL).
-      const domProduct = jsonLdProducts.length ? null : extractDomProduct($, url);
+      // A page with several product cards is a listing/category page, not one product.
+      const isListingPage = listingProducts.length >= 3 && !hasOwnProductDetail($);
+      const domProduct = jsonLdProducts.length || isListingPage ? null : extractDomProduct($, url);
       if (domProduct) await pushProduct(domProduct);
 
       if (productCount >= options.maxProducts) {
@@ -1728,21 +1909,23 @@ async function crawlHtmlFallback(options) {
         return;
       }
 
-      await enqueueLinks({
-        strategy: 'same-domain',
-        transformRequestFunction(req) {
-          try {
-            if (shouldSkipUrl(req.url)) return false;
-            const score = scoreUrl(req.url);
-            const neutralDiscoveryLimit = Math.min(100, Math.max(20, Math.floor(options.maxPages * 0.2)));
-            if (score <= 0 && pageCount > neutralDiscoveryLimit && productCount > 0) return false;
-            req.userData.score = score;
-            return req;
-          } catch {
-            return false;
-          }
-        },
-      });
+      // Product detail URLs go to the front of the queue: with a time-limited run the
+      // crawler otherwise spent its budget on category/info pages (lutz-jesco.com: 50 pages).
+      const transform = (wantProduct) => (req) => {
+        try {
+          if (shouldSkipUrl(req.url)) return false;
+          const score = scoreUrl(req.url);
+          if ((score >= 100) !== wantProduct) return false;
+          const neutralDiscoveryLimit = Math.min(100, Math.max(20, Math.floor(options.maxPages * 0.2)));
+          if (score <= 0 && pageCount > neutralDiscoveryLimit && productCount > 0) return false;
+          req.userData.score = score;
+          return req;
+        } catch {
+          return false;
+        }
+      };
+      await enqueueLinks({ strategy: 'same-domain', forefront: true, transformRequestFunction: transform(true) });
+      await enqueueLinks({ strategy: 'same-domain', transformRequestFunction: transform(false) });
     },
     failedRequestHandler({ request }) {
       summary.warnings.push(`Failed: ${request.url}`);
